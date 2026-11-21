@@ -40,6 +40,8 @@ enum RheosReference {
     /// How strongly a glucose deviation moves a multiplier before the band clamps it.
     static let deviationGain = 0.5
     static let expectedMealRiseMgdl = 40.0
+    /// IOB (units) from which an hour counts as a correction. Its error then teaches ISF, not basal.
+    static let correctionIOB = 1.0
     static let minimumMealsForCarbRatio = 8
     /// Default band, matching Trio's default autosens min/max (`Preferences`).
     static let defaultMinimumMultiplier = 0.7

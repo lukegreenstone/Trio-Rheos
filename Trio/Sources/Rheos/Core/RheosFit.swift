@@ -82,30 +82,61 @@ enum RheosFit {
         }
     }
 
-    /// Ridge regression of (glucose − target) on IOB and still-active carbs,
-    /// then a per-hour factor with shrinkage toward 1 and toward the neighbouring hours.
+    /// Which factor one glucose value can teach, the split oref Autotune makes.
+    /// Absorbing carbs belong to the carb ratio. A correction (IOB of at least
+    /// `RheosReference.correctionIOB`) says how strong a unit is: ISF. Everything else is
+    /// the background need: basal. One error used for both basal and ISF moved insulin twice.
+    enum Lesson {
+        case basal
+        case isf
+        case neither
+    }
+
+    static func lesson(iob: Double, activeCarbs: Double) -> Lesson {
+        if activeCarbs >= 1 { return .neither }
+        return iob >= RheosReference.correctionIOB ? .isf : .basal
+    }
+
+    /// Ridge regression of (glucose − target) on IOB and still-active carbs, then a per-hour
+    /// factor with shrinkage toward 1 and toward the neighbouring hours. Basal learns from
+    /// quiet hours, ISF from correction hours (`lesson`).
     static func fit(observations: [Observation], band: ClosedRange<Double>, priorStrength: Double = RheosBodyPrior.plain) -> Model {
         let slopes = slopes(observations)
-        var residualByHour: [Int: [Double]] = [:]
+        var basalResiduals: [Int: [Double]] = [:]
+        var isfResiduals: [Int: [Double]] = [:]
         for observation in observations {
             let explained = slopes.iob * observation.iob + slopes.carb * observation.activeCarbs
             let residual = (observation.glucose - observation.target) - explained
-            residualByHour[observation.hour, default: []].append(residual)
+            switch lesson(iob: observation.iob, activeCarbs: observation.activeCarbs) {
+            case .basal:
+                basalResiduals[observation.hour, default: []].append(residual)
+            case .isf:
+                isfResiduals[observation.hour, default: []].append(residual)
+            case .neither:
+                break
+            }
         }
         var basal = Array(repeating: 1.0, count: 24)
         var isf = Array(repeating: 1.0, count: 24)
-        var counts = Array(repeating: 0, count: 24)
+        var basalCounts = Array(repeating: 0, count: 24)
+        var isfCounts = Array(repeating: 0, count: 24)
         for hour in 0 ..< 24 {
-            guard let values = residualByHour[hour], values.count >= RheosReference.minimumSamplesPerHour,
-                  let mean = RheosStats.mean(values) else { continue }
             let target = observations.first { $0.hour == hour }?.target ?? RheosReference.missingTargetFallbackMgdl
-            let delta = mean / max(target, 1)
-            basal[hour] = 1 + RheosReference.deviationGain * delta
-            isf[hour] = 1 - RheosReference.deviationGain * delta
-            counts[hour] = values.count
+            if let values = basalResiduals[hour], values.count >= RheosReference.minimumSamplesPerHour,
+               let mean = RheosStats.mean(values)
+            {
+                basal[hour] = 1 + RheosReference.deviationGain * mean / max(target, 1)
+                basalCounts[hour] = values.count
+            }
+            if let values = isfResiduals[hour], values.count >= RheosReference.minimumSamplesPerHour,
+               let mean = RheosStats.mean(values)
+            {
+                isf[hour] = 1 - RheosReference.deviationGain * mean / max(target, 1)
+                isfCounts[hour] = values.count
+            }
         }
-        basal = smooth(shrink(basal, counts: counts, priorStrength: priorStrength), band: band)
-        isf = smooth(shrink(isf, counts: counts, priorStrength: priorStrength), band: band)
+        basal = smooth(shrink(basal, counts: basalCounts, priorStrength: priorStrength), band: band)
+        isf = smooth(shrink(isf, counts: isfCounts, priorStrength: priorStrength), band: band)
         return Model(factors: RheosHourlyFactors(basal: basal, isf: isf, carbRatio: Array(repeating: 1, count: 24)), iobSlope: slopes.iob, carbSlope: slopes.carb)
     }
 
@@ -128,6 +159,7 @@ enum RheosFit {
             return raw
         }
         var byHour: [Int: [Double]] = [:]
+        let usualShare = RheosStats.median(dataset.meals.compactMap { bolusShare(meal: $0, insulin: dataset.insulin) })
         for meal in dataset.meals {
             guard let before = RheosMealDelta.sample(dataset.glucose, at: meal.date),
                   let after = RheosMealDelta.sample(dataset.glucose, at: meal.date.addingTimeInterval(3 * 3600))
@@ -137,7 +169,12 @@ enum RheosFit {
             let hour = calendar.component(.hour, from: meal.date)
             let target = targets.value(atHour: hour)
             let delta = (change - RheosReference.expectedMealRiseMgdl) / max(target, 1)
-            byHour[hour, default: []].append(1 - RheosReference.deviationGain * delta)
+            let fromGlucose = 1 - RheosReference.deviationGain * delta
+            var fromSMB = 1.0
+            if let usualShare, usualShare > 0, let share = bolusShare(meal: meal, insulin: dataset.insulin) {
+                fromSMB = min(1.2, max(0.8, (share / usualShare).squareRoot()))
+            }
+            byHour[hour, default: []].append(fromGlucose * fromSMB)
         }
         for hour in 0 ..< 24 {
             guard let values = byHour[hour], values.count >= 2, let median = RheosStats.median(values) else { continue }
@@ -150,6 +187,22 @@ enum RheosFit {
             let shrunk = (n * value + 2 * 1) / (n + 2)
             return min(max(shrunk, band.lowerBound), band.upperBound)
         }
+    }
+
+    /// In a closed loop a weak carb ratio does not show as a high: SMBs catch it, and the glucose
+    /// three hours later looks fine. This is the meal bolus's share of all bolus insulin in the first
+    /// three hours. Many people enter only part of the calculated bolus on purpose, so the share is
+    /// compared with the person's own usual share, not with 100 %: a time of day that needs more
+    /// SMB than usual gets a stronger ratio. Without a meal bolus the meal is not used here.
+    static func bolusShare(meal: RheosMealEvent, insulin: [RheosInsulinEvent]) -> Double? {
+        let bolus = insulin.filter {
+            $0.kind == "bolus" && abs($0.date.timeIntervalSince(meal.date)) <= 20 * 60
+        }.reduce(0) { $0 + $1.units }
+        guard bolus > 0 else { return nil }
+        let start = meal.date.addingTimeInterval(-20 * 60)
+        let end = meal.date.addingTimeInterval(3 * 3600)
+        let smb = insulin.filter { $0.kind == "smb" && $0.date >= start && $0.date <= end }.reduce(0) { $0 + $1.units }
+        return bolus / (bolus + smb)
     }
 
     static func mealPresets(

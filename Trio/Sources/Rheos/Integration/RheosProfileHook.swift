@@ -25,6 +25,7 @@ enum RheosProfileHook {
         maxBasal: Decimal,
         autosensMin: Decimal,
         autosensMax: Decimal,
+        autosensRatio: Decimal? = nil,
         now: Date
     ) -> Schedules {
         let original = Schedules(basal: basal, isf: isf, carbRatios: carbRatios)
@@ -49,7 +50,10 @@ enum RheosProfileHook {
             autosensMin: double(autosensMin),
             autosensMax: double(autosensMax)
         )
-        let factors = decision.factors.clamped(to: band)
+        var factors = decision.factors.clamped(to: band)
+        if let autosensRatio {
+            factors = RheosAutosensCap.cap(factors, autosensRatio: double(autosensRatio), band: band)
+        }
         log(
             store: store,
             applied: true,

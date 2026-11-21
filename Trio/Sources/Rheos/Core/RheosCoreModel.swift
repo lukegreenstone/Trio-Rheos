@@ -210,24 +210,48 @@ enum RheosCoreModel {
     }
 
     private static func factorsFrom(rows: [Row], weights: [Double], band: ClosedRange<Double>) -> RheosHourlyFactors {
-        var buckets = Array(repeating: [Double](), count: 24)
+        var residuals: [(row: Row, residual: Double)] = []
         for row in rows {
             let predicted = row.target + zip(weights, row.features).reduce(0) { $0 + $1.0 * $1.1 }
-            buckets[row.hour].append(row.actual - predicted)
+            residuals.append((row, row.actual - predicted))
         }
-        return bucketsToFactors(buckets: buckets, rows: rows, band: band)
+        return residualsToFactors(residuals, rows: rows, band: band)
     }
 
-    private static func bucketsToFactors(buckets: [[Double]], rows: [Row], band: ClosedRange<Double>) -> RheosHourlyFactors {
+    /// Same split as `RheosFit.lesson`: quiet hours teach basal, correction hours teach ISF,
+    /// hours with absorbing carbs teach neither. Features 3, 4 and 5 are IOB, carbs and FPU.
+    private static func residualsToFactors(
+        _ residuals: [(row: Row, residual: Double)],
+        rows: [Row],
+        band: ClosedRange<Double>
+    ) -> RheosHourlyFactors {
+        var basalBuckets = Array(repeating: [Double](), count: 24)
+        var isfBuckets = Array(repeating: [Double](), count: 24)
+        for item in residuals {
+            let features = item.row.features
+            let iob = features.count > 3 ? features[3] : 0
+            let carbs = (features.count > 4 ? features[4] : 0) + (features.count > 5 ? features[5] : 0)
+            switch RheosFit.lesson(iob: iob, activeCarbs: carbs) {
+            case .basal:
+                basalBuckets[item.row.hour].append(item.residual)
+            case .isf:
+                isfBuckets[item.row.hour].append(item.residual)
+            case .neither:
+                break
+            }
+        }
         var basal = Array(repeating: 1.0, count: 24)
         var isf = Array(repeating: 1.0, count: 24)
         for hour in 0 ..< 24 {
-            guard buckets[hour].count >= RheosReference.minimumSamplesPerHour else { continue }
-            let mean = buckets[hour].reduce(0, +) / Double(buckets[hour].count)
             let target = rows.first { $0.hour == hour }?.target ?? RheosReference.missingTargetFallbackMgdl
-            let delta = mean / max(target, 1)
-            basal[hour] = min(max(1 + RheosReference.deviationGain * delta, band.lowerBound), band.upperBound)
-            isf[hour] = min(max(1 - RheosReference.deviationGain * delta, band.lowerBound), band.upperBound)
+            if basalBuckets[hour].count >= RheosReference.minimumSamplesPerHour {
+                let mean = basalBuckets[hour].reduce(0, +) / Double(basalBuckets[hour].count)
+                basal[hour] = min(max(1 + RheosReference.deviationGain * mean / max(target, 1), band.lowerBound), band.upperBound)
+            }
+            if isfBuckets[hour].count >= RheosReference.minimumSamplesPerHour {
+                let mean = isfBuckets[hour].reduce(0, +) / Double(isfBuckets[hour].count)
+                isf[hour] = min(max(1 - RheosReference.deviationGain * mean / max(target, 1), band.lowerBound), band.upperBound)
+            }
         }
         return RheosHourlyFactors(basal: basal, isf: isf, carbRatio: Array(repeating: 1, count: 24))
     }
@@ -329,7 +353,7 @@ enum RheosCoreModel {
     }
 
     private static func factorsFromNetwork(rows: [Row], weights: RheosTemporalWeights, band: ClosedRange<Double>) -> RheosHourlyFactors {
-        var buckets = Array(repeating: [Double](), count: 24)
+        var residuals: [(row: Row, residual: Double)] = []
         guard rows.count >= 3, weights.channels == rows[0].features.count else {
             return .identity
         }
@@ -343,9 +367,9 @@ enum RheosCoreModel {
                 dense: weights.dense,
                 bias: weights.denseBias
             ).pred
-            buckets[rows[index].hour].append(rows[index].actual - (rows[index].target + pred))
+            residuals.append((rows[index], rows[index].actual - (rows[index].target + pred)))
         }
-        return bucketsToFactors(buckets: buckets, rows: rows, band: band)
+        return residualsToFactors(residuals, rows: rows, band: band)
     }
 
     private static func activeFPU(at date: Date, meals: [RheosMealEvent]) -> Double {

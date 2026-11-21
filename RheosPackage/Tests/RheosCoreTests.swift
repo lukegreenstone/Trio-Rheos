@@ -119,12 +119,12 @@ final class RheosCoreTests: XCTestCase {
         XCTAssertTrue(decision.applied)
         XCTAssertTrue(decision.walkForward.passed)
         XCTAssertEqual(decision.learnedFactors.basal[12], 1.2, accuracy: 0.001)
-        XCTAssertLessThan(decision.learnedFactors.isf[12], 0.9)
-        XCTAssertGreaterThan(decision.learnedFactors.isf[12], 0.69)
+        // Hours without IOB or carbs teach basal only. The same high no longer lowers ISF as well.
+        XCTAssertEqual(decision.learnedFactors.isf[12], 1, accuracy: 0.001)
         XCTAssertEqual(decision.factors.basal[12], 1.15, accuracy: 0.001)
-        XCTAssertEqual(decision.factors.isf[12], 0.85, accuracy: 0.001)
+        XCTAssertEqual(decision.factors.isf[12], 1, accuracy: 0.001)
         XCTAssertEqual(decision.factors.basal[3], 0.9141414141414139, accuracy: 0.001)
-        XCTAssertEqual(decision.factors.isf[3], 1.0858585858585856, accuracy: 0.001)
+        XCTAssertEqual(decision.factors.isf[3], 1, accuracy: 0.001)
         XCTAssertEqual(decision.factors.basal[8], 1, accuracy: 0.001)
         XCTAssertTrue(decision.factors.carbRatio.allSatisfy { abs($0 - 1) < 0.001 })
         XCTAssertTrue(decision.factors.basal.allSatisfy { $0 >= 0.7 && $0 <= 1.2 })
@@ -512,6 +512,64 @@ final class RheosCoreTests: XCTestCase {
         XCTAssertGreaterThan(at100.learnedFactors.basal[8], 1)
         XCTAssertEqual(at120.learnedFactors.basal[8], 1, accuracy: 0.05)
         XCTAssertGreaterThan(at100.learnedFactors.basal[8], at120.learnedFactors.basal[8])
+    }
+
+    func testRheosTimesAutosensStaysInsideTheAutosensLimits() {
+        let strong = RheosHourlyFactors(
+            basal: Array(repeating: 1.2, count: 24),
+            isf: Array(repeating: 0.8, count: 24),
+            carbRatio: Array(repeating: 0.9, count: 24)
+        )
+        let capped = RheosAutosensCap.cap(strong, autosensRatio: 1.2, band: 0.7 ... 1.2)
+        XCTAssertEqual(capped.basal[0] * 1.2, 1.2, accuracy: 0.001)
+        XCTAssertEqual(1.2 / capped.isf[0], 1.2, accuracy: 0.001)
+        XCTAssertEqual(capped.carbRatio[0], 0.9, accuracy: 0.001)
+
+        let neutral = RheosAutosensCap.cap(.identity, autosensRatio: 0.7, band: 0.7 ... 1.2)
+        XCTAssertTrue(neutral.isIdentity)
+    }
+
+    func testCorrectionHoursTeachISFAndNotBasal() {
+        let observations = (1 ... 10).flatMap { day in
+            (0 ..< 4).map { _ in
+                RheosFit.Observation(
+                    day: date(day: day, hour: 0),
+                    hour: 10,
+                    glucose: 160,
+                    target: 100,
+                    iob: 2,
+                    activeCarbs: 0
+                )
+            }
+        }
+        let model = RheosFit.fit(observations: observations, band: 0.7 ... 1.2)
+        XCTAssertLessThan(model.factors.isf[10], 1)
+        XCTAssertEqual(model.factors.basal[10], 1, accuracy: 0.001)
+    }
+
+    func testBreakfastNeedingMoreSMBThanUsualGetsAStrongerCarbRatio() {
+        var glucose: [RheosGlucosePoint] = []
+        var insulin: [RheosInsulinEvent] = []
+        var meals: [RheosMealEvent] = []
+        for day in 1 ... 10 {
+            for hour in 0 ..< 24 {
+                for minute in [0, 15, 30, 45] {
+                    glucose.append(RheosGlucosePoint(date: date(day: day, hour: hour, minute: minute), mgdl: 110))
+                }
+            }
+            meals.append(RheosMealEvent(id: "b\(day)", date: date(day: day, hour: 8), carbs: 40, fat: 0, protein: 0, note: "", acknowledged: false))
+            meals.append(RheosMealEvent(id: "d\(day)", date: date(day: day, hour: 19), carbs: 40, fat: 0, protein: 0, note: "", acknowledged: false))
+            insulin.append(RheosInsulinEvent(date: date(day: day, hour: 8), units: 2, kind: "bolus"))
+            insulin.append(RheosInsulinEvent(date: date(day: day, hour: 9), units: 1, kind: "smb"))
+            insulin.append(RheosInsulinEvent(date: date(day: day, hour: 19), units: 2, kind: "bolus"))
+        }
+        let factors = RheosFit.carbRatioFactors(
+            dataset: RheosDataset(glucose: glucose, insulin: insulin, meals: meals),
+            targets: .flat(110),
+            band: 0.7 ... 1.2,
+            calendar: calendar
+        )
+        XCTAssertLessThan(factors[8], factors[19])
     }
 
     func testIOBExplainsPartOfAHighGlucoseHour() {

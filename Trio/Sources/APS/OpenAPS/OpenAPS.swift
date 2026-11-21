@@ -581,6 +581,7 @@ final class OpenAPS {
                 maxBasal: pumpSettings.maxBasal,
                 autosensMin: adjustedPreferences.autosensMin,
                 autosensMax: adjustedPreferences.autosensMax,
+                autosensRatio: storage.retrieve(OpenAPS.Settings.autosense, as: Autosens.self)?.ratio,
                 now: clock
             )
 

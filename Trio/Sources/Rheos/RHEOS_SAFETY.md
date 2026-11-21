@@ -10,7 +10,9 @@ The chat prefers Apple's on-device Foundation Models framework on iOS 26 when Ap
 
 Schatten computes hourly basal, ISF and carb-ratio factors and a glucose forecast. Those numbers are logged and shown. They are not written into the profile until Scharf is on, and switching to Scharf shows a preview that has to be confirmed.
 
-The first Scharf day moves a factor by at most the setting between 10% and 20% (default 15%). Later days may use a larger step (default 25%, at most 40%). The band is still 0.70–1.20 intersected with the live autosens min/max. Autosens ratio and dynamic ISF are read for the report only. They are not multiplied into an extra cap.
+The first Scharf day moves a factor by at most the setting between 10% and 20% (default 15%). Later days may use a larger step (default 25%, at most 40%). The band is still 0.70–1.20 intersected with the live autosens min/max. Autosens then works on the profile Rheos already scaled, so at apply time the product is capped as well (`RheosAutosensCap`): Rheos basal factor × autosens ratio, and autosens ratio ÷ Rheos ISF factor, stay inside autosens min/max. A factor of 1 is always allowed. The carb ratio is not capped, autosens does not touch it.
+
+Basal and ISF no longer learn from the same error. A glucose value with absorbing carbs teaches neither (it belongs to the carb ratio). With IOB of at least 1 U it is a correction and teaches ISF. Otherwise it teaches basal. The carb ratio also compares each meal's share of bolus insulin (meal bolus ÷ meal bolus plus the SMBs of the first three hours) with the person's usual share, so a time of day that needs more SMB than usual gets a stronger ratio. A bolus entered as a fixed percentage on purpose does not count against the ratio.
 
 The dosing model is a small on-device temporal network. A ridge regression runs beside it in shadow and both forecast errors are shown in the weekly comparison. Rheos uses whichever of those two has the lower error, and only when that error beats the hourly median. Otherwise the median factors stay. Weights are stored in `rheos-state.json` and trained only on this dataset.
 
@@ -158,3 +160,16 @@ Existing files touched only to show the screen, start the logger, or call the on
 - `Trio.xcodeproj/project.pbxproj` — compile the new Swift files
 
 Not changed: dosing engine, SMB settings, autosens generator, device managers, entitlements, Fastlane, GitHub workflows. HealthKit was already entitled. No new capability is required. The first time Schatten or Scharf is enabled, iOS asks for read access to the wearable types. If the sheet does not list them, enable them in Settings → Health → Data Access → Trio.
+
+## Handy-frei on the watch
+
+The watch runs the same Swift determine-basal as the iPhone (`HandyFreiLoop.tick`) and talks to the Medtrum patch and the Libre 3 itself.
+
+- Temp commands follow `APSManager.enactDetermination` and `MedtrumPumpManager.enactTempBasal`: a rate with a duration is a temp, a rate of 0 with a duration is a zero temp, duration 0 cancels, and no rate keeps the running temp. A cancel is stored as a 0-minute temp so IOB and TDD end the previous one there.
+- With glucose older than 12 minutes only a temp above the scheduled basal is ended. A zero or low temp runs out on the patch, as determine-basal does.
+- Libre 3 values arrive every minute. Like the iPhone (`filterTooFrequentGlucose`), the loop keeps one value per 3.5 minutes, counted back from the newest. Autosens is recomputed when the stored ratio is 30 minutes old, as on the iPhone.
+- A new start from a copy older than 30 minutes holds extra insulin for four hours: max IOB 0, the Low Glucose Suspend limits. Zero and low temps still run. The iPhone refreshes the copy every 10 minutes while the watch is reachable and Handy-frei is off, so this hold normally does not happen. The watch screen can lift it after the user confirms the iPhone gave nothing since the copy.
+- Below 10 % battery the loop keeps running with the same hold, so a zero temp before a low still goes out.
+- While Handy-frei runs, a bolus from the iPhone is refused (`APSManager.enactBolus`). The watch would not know about it.
+- The watch alarms on its own: urgent low (never below a 55 mg/dL floor), low and high with the iPhone's thresholds from the copy, no glucose for 20 minutes, no loop for 20 minutes, a workout that could not restart, and low battery.
+- After a crash or kill, watchOS relaunches the app and `handleActiveWorkoutRecovery` takes the running workout over. The workout does not collect heart rate or energy; it only keeps the app running.

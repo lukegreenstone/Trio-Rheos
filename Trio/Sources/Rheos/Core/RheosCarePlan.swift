@@ -159,6 +159,25 @@ enum RheosWake {
     }
 }
 
+/// Autosens works on the profile Rheos already scaled, so the two multiply, and both react to the
+/// same change in sensitivity. Here the product stays inside Trio's autosens min/max: basal × ratio
+/// and ratio ÷ ISF factor. 1 is always allowed, so the cap never pushes a factor past neutral.
+/// The carb ratio is not touched by autosens and is not capped.
+enum RheosAutosensCap {
+    static func cap(_ factors: RheosHourlyFactors, autosensRatio: Double, band: ClosedRange<Double>) -> RheosHourlyFactors {
+        guard autosensRatio.isFinite, autosensRatio > 0,
+              factors.basal.count == 24, factors.isf.count == 24 else { return factors }
+        let basalLow = min(1, band.lowerBound / autosensRatio)
+        let basalHigh = max(1, band.upperBound / autosensRatio)
+        let isfLow = min(1, autosensRatio / band.upperBound)
+        let isfHigh = max(1, autosensRatio / band.lowerBound)
+        var capped = factors
+        capped.basal = factors.basal.map { min(max($0, basalLow), basalHigh) }
+        capped.isf = factors.isf.map { min(max($0, isfLow), isfHigh) }
+        return capped
+    }
+}
+
 enum RheosDynamicISF {
     static func neutralize(_ factors: RheosHourlyFactors, dynamicISFOn: Bool) -> RheosHourlyFactors {
         guard dynamicISFOn else { return factors }
