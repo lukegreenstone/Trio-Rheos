@@ -3,7 +3,7 @@ import SwiftUI
 import WatchKit
 
 struct TrioMainWatchView: View {
-    @State private var state = WatchState()
+    @State private var state = WatchState.shared
     @Environment(\.scenePhase) private var scenePhase
 
     // misc

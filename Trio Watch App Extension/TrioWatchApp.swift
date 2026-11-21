@@ -27,6 +27,19 @@ import WatchKit
 /// Wakes a running Handy-frei session if watchOS suspended the app. A workout is what
 /// actually keeps the loop alive; this refresh only gets a short chance to start it again.
 final class HandyFreiRefreshDelegate: NSObject, WKApplicationDelegate {
+    /// A background launch (workout recovery, refresh) has no view yet. Binding the shared
+    /// state here lets the session resume without the user opening the app.
+    func applicationDidFinishLaunching() {
+        HandyFreiSession.shared.bind(WatchState.shared)
+    }
+
+    /// Called after a crash or kill while the Handy-frei workout was running.
+    func handleActiveWorkoutRecovery() {
+        Task { @MainActor in
+            await HandyFreiSession.shared.recoverWorkout()
+        }
+    }
+
     func handle(_ backgroundTasks: Set<WKRefreshBackgroundTask>) {
         for task in backgroundTasks {
             if task is WKApplicationRefreshBackgroundTask {

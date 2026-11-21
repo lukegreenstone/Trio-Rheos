@@ -647,6 +647,14 @@ final class BaseAPSManager: APSManager, Injectable {
             return
         }
 
+        // While Handy-frei runs, the watch owns the pump and counts IOB from its own doses.
+        // A bolus from the iPhone would be missing there and the watch would dose on top of it.
+        if HandyFreiGate.phoneLoopPaused {
+            warning(.apsManager, "Handy-frei: bolus refused, the watch owns the pump")
+            callback?(false, "Handy-frei läuft auf der Uhr. Bolus bitte an der Uhr geben.")
+            return
+        }
+
         if let error = verifyStatus() {
             processError(error)
             // Capture broadcaster and queue before async context

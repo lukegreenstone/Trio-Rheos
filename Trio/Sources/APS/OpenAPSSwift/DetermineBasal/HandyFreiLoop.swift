@@ -99,7 +99,8 @@ public enum HandyFreiLoop {
         liveBasalKnown: Bool = false,
         liveBasalIsTemp: Bool = false,
         liveBasalRate: Double = 0,
-        liveBasalStarted: Date = .distantPast
+        liveBasalStarted: Date = .distantPast,
+        insulinHold: Bool = false
     ) -> Outcome {
         let empty = Outcome(
             deliver: false, cancelTemp: false, setTemp: false, rate: 0, minutes: 0, smb: 0,
@@ -112,7 +113,10 @@ public enum HandyFreiLoop {
             var preferences: Preferences = try decode(files, "preferences", "Einstellungen")
             let settings: PumpSettings = try decode(files, "settings", "Pumpeneinstellungen")
             let mode = dosingMode(files)
-            preferences = clampedPreferences(preferences, mode: mode)
+            // A hold (the copy was too old at the start) uses the iPhone's Low Glucose Suspend
+            // limits: max IOB 0, so no SMB and no temp above basal. Zero and low temps still run.
+            let held = insulinHold && mode == "closed"
+            preferences = clampedPreferences(preferences, mode: held ? "lowGlucoseSuspend" : mode)
             if files["tddSufficient"] == "false", preferences.useNewFormula {
                 preferences.useNewFormula = false
                 preferences.sigmoid = false
@@ -274,7 +278,8 @@ public enum HandyFreiLoop {
                 rate: max(0, rate),
                 minutes: max(0, minutes),
                 smb: max(0, smb),
-                reason: (determination?.reason ?? "Keine Bestimmung.") + autosensAge(autosens, now: now) + reservoir(files).note,
+                reason: (held ? "Vorsicht, alte Kopie: kein SMB, kein Extra-Basal. " : "")
+                    + (determination?.reason ?? "Keine Bestimmung.") + autosensAge(autosens, now: now) + reservoir(files).note,
                 iob: currentIOB,
                 maxIOB: maxIOB,
                 maxBolus: maxBolus,
@@ -310,9 +315,21 @@ public enum HandyFreiLoop {
         if let raw = files["glucoseHistory"]?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
             points = (try? JSONBridge.from(string: raw)) ?? []
         }
-        let smoothed = smoothGlucose(files) ? smoothedValues(watch) : [:]
-        for sample in watch.sorted(by: { $0.date < $1.date }) {
-            if points.contains(where: { abs($0.dateString.timeIntervalSince(sample.date)) < 3.5 * 60 }) { continue }
+        // The Libre on the watch sends a value every minute. The iPhone stores one only when it is
+        // at least 3.5 minutes after the previous one (GlucoseStorage.filterTooFrequentGlucose), and
+        // COB and autosens bucket the series on that spacing. Walk back from the newest value so the
+        // loop always sees the latest reading, then keep one value per 3.5 minutes.
+        let minimumGap: TimeInterval = 3.5 * 60
+        let phoneDates = points.map(\.dateString)
+        var kept: [(date: Date, mgdl: Int)] = []
+        for sample in watch.sorted(by: { $0.date > $1.date }) {
+            if let last = kept.last, last.date.timeIntervalSince(sample.date) < minimumGap { continue }
+            if phoneDates.contains(where: { abs($0.timeIntervalSince(sample.date)) < minimumGap }) { continue }
+            kept.append(sample)
+        }
+        kept.reverse()
+        let smoothed = smoothGlucose(files) ? smoothedValues(kept) : [:]
+        for sample in kept {
             let mgdl = smoothed[sample.date] ?? sample.mgdl
             let arrow = directions[sample.date.timeIntervalSince1970].flatMap { BloodGlucose.Direction(rawValue: $0) }
             points.append(BloodGlucose(
@@ -1073,7 +1090,10 @@ public enum HandyFreiLoop {
         now: Date
     ) -> [String: String] {
         var files = files
-        if let json = recomputeAutosens(
+        // The iPhone recomputes autosens only when the stored ratio is 30 minutes old
+        // (APSManager.autosense). Both 8 h and 24 h runs are the heaviest part of a loop.
+        let autosensDue = (autosensAgeMinutes(files, now: now) ?? 30) >= 30
+        if autosensDue, let json = recomputeAutosens(
             files: files,
             rheosBasal: rheosBasal,
             rheosISF: rheosISF,

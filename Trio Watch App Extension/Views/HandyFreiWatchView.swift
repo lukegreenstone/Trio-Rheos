@@ -2,6 +2,7 @@ import HandyFreiDrivers
 import HealthKit
 import SwiftUI
 import Trio
+import UserNotifications
 import WatchConnectivity
 import WatchKit
 
@@ -27,6 +28,14 @@ struct HandyFreiWatchView: View {
                     Text(state.handyFreiAlarm)
                         .font(.footnote)
                         .foregroundStyle(.orange)
+                }
+                if state.handyFreiRunning, let hold = state.handyFreiHoldUntil {
+                    Text("Vorsicht bis \(hold.formatted(date: .omitted, time: .shortened)): Die Kopie war beim Start alt. Kein SMB und kein Extra-Basal, Absenken läuft weiter.")
+                        .font(.footnote)
+                        .foregroundStyle(.yellow)
+                    Button("iPhone hat seit der Kopie nichts dosiert") {
+                        HandyFreiSession.shared.clearInsulinHold(state)
+                    }
                 }
                 if !state.handyFreiRunning {
                     Button("Handy-frei aktivieren") {
@@ -207,6 +216,8 @@ final class HandyFreiSession {
     private var lastLoopAt = Date.distantPast
     private var doseStartedAt: Date?
     private var bolusUncertain = false
+    /// Under 10 % battery: the loop only lowers insulin.
+    private var lowBattery = false
     private var determining = false
     private var lastSuccess = Date.distantPast
     private var lastReason = "Loop wartet auf den ersten Wert."
@@ -227,7 +238,10 @@ final class HandyFreiSession {
     func start(_ state: WatchState) {
         bind(state)
         guard !state.handyFreiRunning else { return }
+        // A resume after a crash or relaunch continues the same stretch. Only a new start checks the copy age.
+        let resuming = HandyFreiDisk.wasActive()
         state.handyFreiRunning = true
+        HandyFreiAlarm.requestPermission()
         doseEpoch += 1
         backoffTask?.cancel()
         backoffTask = nil
@@ -259,9 +273,11 @@ final class HandyFreiSession {
         lastDose = .distantPast
         lastReason = "Loop wartet auf den ersten Wert."
         HandyFreiDisk.restore(into: state, session: self)
+        if !resuming { armInsulinHold(state) }
+        state.handyFreiHoldUntil = insulinHoldUntil
         self.seedSnapshotGlucose(state)
         self.showSnapshotTotals(state)
-        HandyFreiDisk.save(session: self)
+        HandyFreiDisk.save(session: self, urgent: true)
         self.scheduleRefresh()
         lastLoopAt = lastSuccess == .distantPast ? Date() : lastSuccess
         address = state.handyFreiBleAddress
@@ -277,7 +293,7 @@ final class HandyFreiSession {
                 Task { await self.restorePump(state) }
             }
         }
-        Task {
+        Task { @MainActor in
             guard state.handyFreiRunning, epoch == self.doseEpoch else { return }
             self.startLoopWatch(state, epoch: epoch)
             self.startAutosensRefresh(state, epoch: epoch)
@@ -313,16 +329,58 @@ final class HandyFreiSession {
         }
     }
 
+    private static let holdKey = "handyfrei.insulinHoldUntil"
+
+    /// Doses the iPhone gave after the last copy are not in it. A new start from a copy older than
+    /// 30 minutes therefore holds extra insulin for four hours: no SMB and no temp above basal,
+    /// the same limits as Trio's Low Glucose Suspend. Zero and low temps still run.
+    private func armInsulinHold(_ state: WatchState) {
+        let age = Date().timeIntervalSince(state.handyFreiSnapshotAt ?? .distantPast)
+        guard age > 30 * 60 else {
+            UserDefaults.standard.removeObject(forKey: Self.holdKey)
+            return
+        }
+        let until = Date().addingTimeInterval(4 * 3600)
+        UserDefaults.standard.set(until.timeIntervalSince1970, forKey: Self.holdKey)
+        let minutes = age > 24 * 3600 ? "über 24 h" : "\(Int(age / 60)) min"
+        log.append([
+            "date": Date().timeIntervalSince1970,
+            "kind": "stage",
+            "text": "Kopie \(minutes) alt. Bis \(Self.clockMinute(until)) kein SMB und kein Extra-Basal."
+        ])
+    }
+
+    var insulinHoldUntil: Date? {
+        let raw = UserDefaults.standard.double(forKey: Self.holdKey)
+        guard raw > 0 else { return nil }
+        let until = Date(timeIntervalSince1970: raw)
+        return until > Date() ? until : nil
+    }
+
+    /// A hand-off copy: the iPhone paused its loop before it sent it, so it holds every iPhone dose.
+    func freshCopyArrived(_ state: WatchState) {
+        UserDefaults.standard.removeObject(forKey: Self.holdKey)
+        state.handyFreiHoldUntil = nil
+    }
+
+    /// The user confirms the iPhone gave no insulin after the copy.
+    func clearInsulinHold(_ state: WatchState) {
+        UserDefaults.standard.removeObject(forKey: Self.holdKey)
+        state.handyFreiHoldUntil = nil
+        log.append(["date": Date().timeIntervalSince1970, "kind": "stage", "text": "Vorsicht aufgehoben."])
+        HandyFreiDisk.save(session: self, urgent: true)
+    }
+
     /// No insulin once the newest reading is older than 12 minutes. The session stays up.
     private func startLoopWatch(_ state: WatchState, epoch: Int) {
         loopWatchTask?.cancel()
-        loopWatchTask = Task { await self.watchLoop(state, epoch: epoch) }
+        loopWatchTask = Task { @MainActor in await self.watchLoop(state, epoch: epoch) }
     }
 
     /// Keeps the phone heartbeat. Autosens itself runs inside every loop.
     private func startAutosensRefresh(_ state: WatchState, epoch: Int) {
         autosensTask?.cancel()
-        autosensTask = Task { [weak self] in
+        autosensTask = Task { @MainActor [weak self] in
             guard let self else { return }
             while state.handyFreiRunning, epoch == self.doseEpoch, !Task.isCancelled {
                 self.scheduleRefresh()
@@ -371,7 +429,7 @@ final class HandyFreiSession {
     }
 
     /// Keeps the countdown moving, and starts the loop when it reaches zero.
-    private func watchLoop(_ state: WatchState, epoch: Int) async {
+    @MainActor private func watchLoop(_ state: WatchState, epoch: Int) async {
         while state.handyFreiRunning, epoch == doseEpoch, !Task.isCancelled {
             try? await Task.sleep(nanoseconds: 15_000_000_000)
             guard state.handyFreiRunning, epoch == doseEpoch, !Task.isCancelled else { return }
@@ -394,6 +452,18 @@ final class HandyFreiSession {
                 let remain = self.secondsUntilLoop()
                 let quiet = Date().timeIntervalSince(self.lastLoopAt)
                 let watchdog = quiet > 7 * 60 && !self.determining && !self.dosing
+                state.handyFreiHoldUntil = self.insulinHoldUntil
+                let sinceSuccess = Date().timeIntervalSince(self.lastSuccess)
+                if self.lastSuccess != .distantPast, sinceSuccess > 20 * 60 {
+                    HandyFreiAlarm.fire(
+                        "handyfrei.loop",
+                        every: 20 * 60,
+                        title: "Loop läuft nicht",
+                        body: "Letzter Loop auf der Uhr vor \(Int(sinceSuccess / 60)) min. Handy-frei öffnen."
+                    )
+                } else {
+                    HandyFreiAlarm.reset("handyfrei.loop")
+                }
                 guard let last = self.readings.max(by: { $0.date < $1.date }) else {
                     if watchdog {
                         state.handyFreiStatus = "\(Self.clock()) Loop-Wächter: letzter Lauf vor \(Int(quiet / 60)) min. Noch kein Glukosewert."
@@ -518,10 +588,10 @@ final class HandyFreiSession {
     private func startGlucoseWatch(_ state: WatchState, epoch: Int) {
         glucoseAgeTask?.cancel()
         let started = Date()
-        glucoseAgeTask = Task { await self.watchGlucoseAge(state, epoch: epoch, started: started) }
+        glucoseAgeTask = Task { @MainActor in await self.watchGlucoseAge(state, epoch: epoch, started: started) }
     }
 
-    private func watchGlucoseAge(_ state: WatchState, epoch: Int, started: Date) async {
+    @MainActor private func watchGlucoseAge(_ state: WatchState, epoch: Int, started: Date) async {
         while state.handyFreiRunning, epoch == doseEpoch, !Task.isCancelled {
             try? await Task.sleep(nanoseconds: 60_000_000_000)
             guard state.handyFreiRunning, epoch == doseEpoch else { return }
@@ -535,7 +605,18 @@ final class HandyFreiSession {
                     await reconnectStalledSensor(state, quietMinutes: Int(quiet / 60))
                 }
             }
-            guard Date().timeIntervalSince(newest) > 12 * 60 else { continue }
+            let silent = Date().timeIntervalSince(newest)
+            if silent > 20 * 60 {
+                HandyFreiAlarm.fire(
+                    "handyfrei.noGlucose",
+                    every: 20 * 60,
+                    title: "Kein Glukosewert",
+                    body: "Seit \(Int(silent / 60)) min kein Wert vom Sensor. Kein neues Insulin."
+                )
+            } else {
+                HandyFreiAlarm.reset("handyfrei.noGlucose")
+            }
+            guard silent > 12 * 60 else { continue }
             let files = await MainActor.run { state.handyFreiFiles }
             guard HandyFreiLoop.enactsInsulin(files) else { continue }
             await mark(state, "Glukose älter als 12 Minuten. Kein Insulin.")
@@ -562,13 +643,15 @@ final class HandyFreiSession {
         }
     }
 
-    /// Restarts the workout only after it has actually ended, and not more often than every 30 seconds.
-    private func keepAwake(_ state: WatchState, reason: String) async {
+    /// Restarts the workout as soon as it has ended. watchOS suspends a background app shortly after
+    /// its workout ends, so a long wait here means the restart never runs. Only a session that ends
+    /// again within a minute waits 5 seconds. If the restart fails, a notification asks to open Trio:
+    /// in the foreground the next wake starts the workout again.
+    @MainActor private func keepAwake(_ state: WatchState, reason: String) async {
         guard state.handyFreiRunning else { return }
         if HandyFreiWorkout.shared.isRunning { return }
-        let elapsed = Date().timeIntervalSince(lastWorkoutRestart)
-        if elapsed < 30 {
-            try? await Task.sleep(nanoseconds: UInt64((30 - elapsed) * 1_000_000_000))
+        if Date().timeIntervalSince(lastWorkoutRestart) < 60 {
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
         }
         guard state.handyFreiRunning, !HandyFreiWorkout.shared.isRunning else { return }
         lastWorkoutRestart = Date()
@@ -591,15 +674,21 @@ final class HandyFreiSession {
                 "kind": "stage",
                 "text": detail.isEmpty ? "Workout nicht gestartet" : "Workout nicht gestartet: \(detail)"
             ])
-            await MainActor.run {
-                self.giveUpOrRetry(state, "HealthKit nicht erlaubt.")
-            }
+            HandyFreiAlarm.fire(
+                "handyfrei.workout",
+                every: 10 * 60,
+                title: "Handy-frei pausiert",
+                body: "Die Uhr konnte das Workout nicht neu starten. Trio auf der Uhr öffnen, damit der Loop weiterläuft."
+            )
+            giveUpOrRetry(state, detail.isEmpty ? "Workout nicht gestartet." : "Workout nicht gestartet: \(detail)")
             return
         }
+        HandyFreiAlarm.reset("handyfrei.workout")
+        HandyFreiAlarm.clear("handyfrei.workout")
     }
 
     /// Three tries, then the phone takes the radio back. Reconnect uses the saved token. It does not pair again.
-    private func openPump(_ state: WatchState, attempt: Int) async throws {
+    @MainActor private func openPump(_ state: WatchState, attempt: Int) async throws {
         await mark(state, attempt == 1 ? "Pumpe: suche" : "Pumpe: erneut \(attempt)")
         do {
             HandyFreiMedtrumLink.shared.stop()
@@ -655,7 +744,7 @@ final class HandyFreiSession {
 
     /// The BLE link can stay "connected" while notifications stop. A new cached
     /// handshake uses the same phase-5 key. It does not re-pair or deactivate.
-    private func reconnectStalledSensor(_ state: WatchState, quietMinutes: Int) async {
+    @MainActor private func reconnectStalledSensor(_ state: WatchState, quietMinutes: Int) async {
         guard state.handyFreiRunning, !replacingSensor else { return }
         lastStallAttempt = Date()
         stallAttempts += 1
@@ -675,7 +764,7 @@ final class HandyFreiSession {
         }
     }
 
-    private func openSensor(_ state: WatchState, announce: String? = nil) async throws {
+    @MainActor private func openSensor(_ state: WatchState, announce: String? = nil) async throws {
         sensorGeneration += 1
         let generation = sensorGeneration
         replacingSensor = true
@@ -713,7 +802,7 @@ final class HandyFreiSession {
         await mark(state, "Sensor: verbunden, warte auf Werte")
     }
 
-    private func restorePump(_ state: WatchState) async {
+    @MainActor private func restorePump(_ state: WatchState) async {
         guard state.handyFreiRunning else { return }
         pumpRetries += 1
         guard pumpRetries <= 3 else {
@@ -732,7 +821,7 @@ final class HandyFreiSession {
         }
     }
 
-    private func restoreSensor(_ state: WatchState) async {
+    @MainActor private func restoreSensor(_ state: WatchState) async {
         guard state.handyFreiRunning, !replacingSensor else { return }
         sensorRetries += 1
         guard sensorRetries <= 3 else {
@@ -749,7 +838,7 @@ final class HandyFreiSession {
         }
     }
 
-    private func noteSensor(_ state: WatchState, _ text: String) async {
+    @MainActor private func noteSensor(_ state: WatchState, _ text: String) async {
         if text.hasPrefix("Sensor: Paket") || text.contains("mg/dL") {
             await MainActor.run { self.lastPacketAt = Date() }
         }
@@ -762,7 +851,7 @@ final class HandyFreiSession {
         await mark(state, text)
     }
 
-    private func mark(_ state: WatchState, _ text: String) async {
+    @MainActor private func mark(_ state: WatchState, _ text: String) async {
         await MainActor.run {
             guard state.handyFreiStatus != text else { return }
             state.handyFreiStatus = text
@@ -811,14 +900,22 @@ final class HandyFreiSession {
         return "\(headline). \(error.localizedDescription). Die Uhr sucht weiter."
     }
 
+    /// Below 10 % battery the loop keeps running, but only to lower insulin (zero and low temps).
+    /// Stopping the loop there would also stop the zero temp before a low.
     private func absorb(_ state: WatchState, _ mgdl: Int, direction: String) {
         guard state.handyFreiRunning else { return }
         let device = WKInterfaceDevice.current()
         device.isBatteryMonitoringEnabled = true
-        if device.batteryLevel >= 0, device.batteryLevel < 0.1 {
-            state.handyFreiStatus = "Akku unter 10 Prozent. Kein Insulin."
-            state.handyFreiLoopLine = state.handyFreiStatus
-            return
+        lowBattery = device.batteryLevel >= 0 && device.batteryLevel < 0.1
+        if lowBattery {
+            HandyFreiAlarm.fire(
+                "handyfrei.battery",
+                every: 30 * 60,
+                title: "Uhr-Akku unter 10 %",
+                body: "Handy-frei senkt nur noch Insulin. Uhr laden oder zum iPhone wechseln."
+            )
+        } else {
+            HandyFreiAlarm.reset("handyfrei.battery")
         }
         evaluate(state, mgdl: mgdl, appendReading: true, direction: direction)
     }
@@ -872,7 +969,8 @@ final class HandyFreiSession {
             liveBasalKnown: live.known,
             liveBasalIsTemp: live.isTemp,
             liveBasalRate: live.rate,
-            liveBasalStarted: live.started
+            liveBasalStarted: live.started,
+            insulinHold: insulinHoldUntil != nil || lowBattery
         )
     }
 
@@ -911,7 +1009,8 @@ final class HandyFreiSession {
             stallAttempts = 0
             prune()
             log.append(["date": Date().timeIntervalSince1970, "kind": "glucose", "mgdl": mgdl])
-            HandyFreiDisk.save(session: self)
+            HandyFreiDisk.save(session: self, urgent: false)
+            HandyFreiAlarm.check(mgdl: mgdl, files: state.handyFreiFiles)
         }
         let revision = mealRevision
         let remain = secondsUntilLoop()
@@ -949,7 +1048,7 @@ final class HandyFreiSession {
             state.handyFreiStatus = line
             state.handyFreiLoopLine = line
             log.append(["date": Date().timeIntervalSince1970, "kind": "determination", "text": line])
-            HandyFreiDisk.save(session: self)
+            HandyFreiDisk.save(session: self, urgent: false)
             return
         }
         lastSuccess = Date()
@@ -980,7 +1079,7 @@ final class HandyFreiSession {
             "cob": outcome.cob,
             "mgdl": mgdl
         ])
-        HandyFreiDisk.save(session: self)
+        HandyFreiDisk.save(session: self, urgent: false)
         // "No temp required" keeps the running temp and needs no pump traffic.
         let setsTemp = outcome.setTemp && outcome.minutes > 0
         let changesTemp = setsTemp || outcome.cancelTemp
@@ -993,7 +1092,7 @@ final class HandyFreiSession {
         let rate = Self.medtrumStep(min(outcome.rate, outcome.maxBasal))
         let units = Self.medtrumStep(min(outcome.smb, outcome.maxBolus))
         let uncertain = bolusUncertain
-        Task {
+        Task { @MainActor in
             var finished = preview
             defer {
                 let line = finished
@@ -1056,7 +1155,7 @@ final class HandyFreiSession {
                     HandyFreiDisk.save(session: self)
                 }
                 finished += " · SMB \(String(format: "%.2f", units)) U ok"
-                await self.refreshTotals(state, mgdl: mgdl, line: finished)
+                await self.refreshTotals(state, mgdl: mgdl, line: finished, added: units)
             } else {
                 await MainActor.run {
                     self.bolusUncertain = true
@@ -1070,7 +1169,7 @@ final class HandyFreiSession {
     }
 
     /// Reads the pump before another SMB when the last bolus reply was missing.
-    private func confirmBolusState(_ state: WatchState) async -> Bool {
+    @MainActor private func confirmBolusState(_ state: WatchState) async -> Bool {
         await MainActor.run {
             state.handyFreiStatus = "\(Self.clockMinute()) Pumpe: Verlauf, bevor ein neues SMB geht."
         }
@@ -1085,21 +1184,18 @@ final class HandyFreiSession {
         }
     }
 
-    private func refreshTotals(_ state: WatchState, mgdl: Int, line: String) async {
-        let outcome = tickNow(state)
-        guard !outcome.failed else { return }
-        await MainActor.run {
-            self.lastIOB = outcome.iob
-            self.lastCOB = outcome.cob
-            state.iob = String(format: "%.1f", outcome.iob)
-            state.cob = String(format: "%.0f", outcome.cob)
-            state.handyFreiStatus = line
-            state.handyFreiLoopLine = line
-        }
+    /// Shows the result of this pass. The next loop recomputes IOB; a second determine-basal run
+    /// only to refresh the display cost as much as the loop itself.
+    @MainActor private func refreshTotals(_ state: WatchState, mgdl _: Int, line: String, added: Double = 0) async {
+        lastIOB += max(0, added)
+        state.iob = String(format: "%.1f", lastIOB)
+        state.cob = String(format: "%.0f", lastCOB)
+        state.handyFreiStatus = line
+        state.handyFreiLoopLine = line
     }
 
     /// Manual bolus from the + button. Uses the saved pump session. Does not pair again.
-    func manualBolus(_ state: WatchState, units: Double) async {
+    @MainActor func manualBolus(_ state: WatchState, units: Double) async {
         let cap = Double(truncating: state.maxBolus as NSNumber)
         let newest = await MainActor.run { state.handyFreiGlucoseDate ?? Date.distantPast }
         if Date().timeIntervalSince(newest) > 12 * 60 {
@@ -1155,7 +1251,7 @@ final class HandyFreiSession {
     }
 
     /// One retry after a fresh synchronize. A second failure is logged and the loop stays up.
-    private func deliverTemp(_ state: WatchState, rate: Double, minutes: Int) async -> Bool {
+    @MainActor private func deliverTemp(_ state: WatchState, rate: Double, minutes: Int) async -> Bool {
         let label = rate <= 0 ? "cancelTempBasal" : "setTempBasal \(rate)"
         for attempt in 1 ... 2 {
             await MainActor.run { state.handyFreiStatus = "Pumpe: \(label)" }
@@ -1175,7 +1271,7 @@ final class HandyFreiSession {
         return false
     }
 
-    private func deliverBolus(_ state: WatchState, units: Double) async -> Bool {
+    @MainActor private func deliverBolus(_ state: WatchState, units: Double) async -> Bool {
         for attempt in 1 ... 2 {
             await MainActor.run { state.handyFreiStatus = "Pumpe: bolus \(units)" }
             do {
@@ -1195,7 +1291,7 @@ final class HandyFreiSession {
     }
 
     /// Shown on the watch. A missing session is not queued to the iPhone.
-    private func showPumpFailure(_ state: WatchState, command: String, error: Error) async {
+    @MainActor private func showPumpFailure(_ state: WatchState, command: String, error: Error) async {
         let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         let text = detail == "nicht gefunden"
             ? "\(Self.clock()) \(command): Pumpe nicht verbunden"
@@ -1222,7 +1318,7 @@ final class HandyFreiSession {
     }
 
     /// The command may already be on the pump. The iPhone reads the pump history after it reconnects.
-    private func noteUncertain(_ error: Error) async {
+    @MainActor private func noteUncertain(_ error: Error) async {
         let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         await MainActor.run {
             log.append([
@@ -1277,7 +1373,7 @@ final class HandyFreiSession {
         ])
         guard backoffTask == nil else { return }
         let epoch = doseEpoch
-        backoffTask = Task { [weak self] in
+        backoffTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
                 if self.doseEpoch == epoch { self.backoffTask = nil }
@@ -1338,6 +1434,20 @@ final class HandyFreiSession {
         }
     }
 
+    /// watchOS relaunched the app in the background because its workout was still active
+    /// (crash, memory kill). A stretch that was running continues; the workout is taken over in
+    /// `HandyFreiWorkout.prepare`. A workout without a running stretch is ended.
+    @MainActor func recoverWorkout() async {
+        let state = boundState ?? WatchState.shared
+        bind(state)
+        if HandyFreiDisk.wasActive() {
+            log.append(["date": Date().timeIntervalSince1970, "kind": "stage", "text": "Workout nach Neustart der App übernommen."])
+            resumeIfNeeded(state)
+        } else if await HandyFreiWorkout.shared.recover() {
+            HandyFreiWorkout.shared.stop()
+        }
+    }
+
     private func scheduleRefresh() {
         WKApplication.shared().scheduleBackgroundRefresh(
             withPreferredDate: Date().addingTimeInterval(15 * 60),
@@ -1381,16 +1491,25 @@ final class HandyFreiSession {
     }
 
     /// Queued delivery of every dose, glucose and meal the phone does not have yet.
+    /// Every flush carries all rows the phone has not acknowledged. While the phone is away the
+    /// rows go into the WatchConnectivity queue, so an older queued copy is cancelled first and the
+    /// flush runs only every 10 minutes. Otherwise the queue grows by a full copy every 45 seconds.
     func flushOutbox(final: Bool) {
-        if !final, Date().timeIntervalSince(lastOutboxFlush) < 45 { return }
         guard WCSession.isSupported() else { return }
         let session = boundState?.session ?? WCSession.default
         guard session.activationState == .activated else { return }
+        let interval: TimeInterval = session.isReachable ? 45 : 10 * 60
+        if !final, Date().timeIntervalSince(lastOutboxFlush) < interval { return }
         HandyFreiDisk.preload(self)
         lastOutboxFlush = Date()
+        var isFinal = final
+        for transfer in session.outstandingUserInfoTransfers where transfer.userInfo["handyFreiLog"] != nil {
+            if (transfer.userInfo["handyFreiLogFinal"] as? Bool) == true { isFinal = true }
+            transfer.cancel()
+        }
         let rows = outboxRows()
         if rows.isEmpty {
-            guard final else { return }
+            guard isFinal else { return }
             sendOutboxChunk([], final: true, session: session)
             return
         }
@@ -1398,7 +1517,7 @@ final class HandyFreiSession {
         var index = 0
         while index < rows.count {
             let end = min(index + size, rows.count)
-            sendOutboxChunk(Array(rows[index ..< end]), final: final && end == rows.count, session: session)
+            sendOutboxChunk(Array(rows[index ..< end]), final: isFinal && end == rows.count, session: session)
             index = end
         }
     }
@@ -1461,9 +1580,13 @@ final class HandyFreiSession {
     private func sendOutboxChunk(_ rows: [[String: Any]], final: Bool, session: WCSession) {
         var message: [String: Any] = ["handyFreiLog": rows]
         if final { message["handyFreiLogFinal"] = true }
-        session.transferUserInfo(message)
+        // One path per chunk. A reachable phone gets it now; a failed send falls back to the queue.
         if session.isReachable {
-            session.sendMessage(message, replyHandler: nil) { _ in }
+            session.sendMessage(message, replyHandler: nil) { _ in
+                session.transferUserInfo(message)
+            }
+        } else {
+            session.transferUserInfo(message)
         }
     }
 
@@ -1688,8 +1811,20 @@ final class HandyFreiSession {
             }
         }
 
-        static func save(session: HandyFreiSession) {
+        /// The decoded file stays in memory, so a save does not read and decode it first.
+        private static var cache: File?
+        private static var lastWrite = Date.distantPast
+
+        /// Doses, meals, adjustments and stops are written at once (`urgent`). Glucose and
+        /// determination rows are written at most every 5 minutes; the next write carries them.
+        /// The loop files are written too, so an override or autosens from the watch survives a relaunch.
+        static func save(session: HandyFreiSession, urgent: Bool = true) {
+            defer { session.flushOutbox(final: false) }
+            guard urgent || Date().timeIntervalSince(lastWrite) >= 5 * 60 else { return }
             var file = load() ?? File()
+            if let state = session.boundState, !state.handyFreiFiles.isEmpty {
+                file.files = state.handyFreiFiles
+            }
             file.deliveries = session.deliveries.map {
                 StoredDelivery(kind: $0.kind, units: $0.units, minutes: $0.minutes, date: $0.date.timeIntervalSince1970, label: $0.label)
             }
@@ -1704,7 +1839,6 @@ final class HandyFreiSession {
             file.logJSON = (try? JSONSerialization.data(withJSONObject: session.log)) ?? file.logJSON
             file.active = session.active
             write(file)
-            session.flushOutbox(final: false)
         }
 
         static func preload(_ session: HandyFreiSession) {
@@ -1800,11 +1934,16 @@ final class HandyFreiSession {
         }
 
         private static func load() -> File? {
+            if let cache { return cache }
             guard let url = fileURL(), let data = try? Data(contentsOf: url) else { return nil }
-            return try? JSONDecoder().decode(File.self, from: data)
+            let file = try? JSONDecoder().decode(File.self, from: data)
+            cache = file
+            return file
         }
 
         private static func write(_ file: File) {
+            cache = file
+            lastWrite = Date()
             guard let url = fileURL(), let data = try? JSONEncoder().encode(file) else { return }
             try? data.write(to: url, options: .atomic)
         }
@@ -1840,16 +1979,41 @@ final class HandyFreiWorkout: NSObject, HKWorkoutSessionDelegate, HKLiveWorkoutB
         }
     }
 
-    func prepare(onEnd: @escaping (String) -> Void) async -> Bool {
+    /// After a crash or kill, watchOS relaunches the app and keeps its workout running
+    /// (`handleActiveWorkoutRecovery`). That session is taken over instead of starting a second one.
+    @MainActor func recover() async -> Bool {
+        if isRunning { return true }
+        let recovered: HKWorkoutSession? = await withCheckedContinuation { continuation in
+            store.recoverActiveWorkoutSession { session, _ in
+                continuation.resume(returning: session)
+            }
+        }
+        guard let recovered, recovered.state == .running || recovered.state == .paused else { return false }
+        ignoreEnd = false
+        recovered.delegate = self
+        let builder = recovered.associatedWorkoutBuilder()
+        builder.delegate = self
+        session = recovered
+        self.builder = builder
+        if recovered.state == .paused { recovered.resume() }
+        return true
+    }
+
+    @MainActor func prepare(onEnd: @escaping (String) -> Void) async -> Bool {
         self.onEnd = onEnd
         if isRunning { return true }
         let workout = HKObjectType.workoutType()
         do {
             try await store.requestAuthorization(toShare: [workout], read: [workout])
         } catch {
+            lastFailure = "HealthKit: \(error.localizedDescription)"
             return false
         }
-        guard store.authorizationStatus(for: workout) == .sharingAuthorized else { return false }
+        guard store.authorizationStatus(for: workout) == .sharingAuthorized else {
+            lastFailure = "HealthKit: Workouts nicht erlaubt"
+            return false
+        }
+        if await recover() { return true }
         let configuration = HKWorkoutConfiguration()
         configuration.activityType = .other
         configuration.locationType = .indoor
@@ -1857,7 +2021,16 @@ final class HandyFreiWorkout: NSObject, HKWorkoutSessionDelegate, HKLiveWorkoutB
             let session = try HKWorkoutSession(healthStore: store, configuration: configuration)
             let builder = session.associatedWorkoutBuilder()
             builder.delegate = self
-            builder.dataSource = HKLiveWorkoutDataSource(healthStore: store, workoutConfiguration: configuration)
+            let source = HKLiveWorkoutDataSource(healthStore: store, workoutConfiguration: configuration)
+            // The workout only keeps the app running. The loop needs neither heart rate nor energy,
+            // and continuous workout heart rate is the largest battery cost of a day-long session.
+            let unused: [HKQuantityTypeIdentifier] = [.heartRate, .activeEnergyBurned, .basalEnergyBurned]
+            for identifier in unused {
+                if let type = HKQuantityType.quantityType(forIdentifier: identifier) {
+                    source.disableCollection(for: type)
+                }
+            }
+            builder.dataSource = source
             ignoreEnd = false
             session.delegate = self
             self.session = session
@@ -1875,8 +2048,10 @@ final class HandyFreiWorkout: NSObject, HKWorkoutSessionDelegate, HKLiveWorkoutB
                 session.end()
                 return false
             }
+            lastFailure = ""
             return true
         } catch {
+            lastFailure = error.localizedDescription
             return false
         }
     }
@@ -1888,23 +2063,37 @@ final class HandyFreiWorkout: NSObject, HKWorkoutSessionDelegate, HKLiveWorkoutB
         let ending = session
         builder = nil
         session = nil
-        collected?.endCollection(withEnd: Date()) { _, _ in }
+        // Nothing is saved to Health. The builder is discarded once collection has ended.
+        collected?.endCollection(withEnd: Date()) { _, _ in
+            collected?.discardWorkout()
+        }
         ending?.end()
     }
 
+    /// HealthKit calls these on its own queue. Session state is only changed on the main thread.
     func workoutSession(
         _ workoutSession: HKWorkoutSession,
         didChangeTo toState: HKWorkoutSessionState,
         from fromState: HKWorkoutSessionState,
         date _: Date
     ) {
-        // .paused and .stopped are not a new session. Only a finished one is.
-        guard toState == .ended else { return }
-        reportEnd(workoutSession, "beendet (\(String(describing: fromState)))")
+        DispatchQueue.main.async {
+            switch toState {
+            case .paused:
+                // Not a real workout: a pause (for example a button press) would only weaken the keep-alive.
+                if workoutSession === self.session { workoutSession.resume() }
+            case .ended:
+                self.reportEnd(workoutSession, "beendet (\(String(describing: fromState)))")
+            default:
+                break
+            }
+        }
     }
 
     func workoutSession(_ workoutSession: HKWorkoutSession, didFailWithError error: Error) {
-        reportEnd(workoutSession, error.localizedDescription)
+        DispatchQueue.main.async {
+            self.reportEnd(workoutSession, error.localizedDescription)
+        }
     }
 
     func workoutBuilderDidCollectEvent(_: HKLiveWorkoutBuilder) {}
@@ -1923,5 +2112,99 @@ final class HandyFreiWorkout: NSObject, HKWorkoutSessionDelegate, HKLiveWorkoutB
         session = nil
         builder = nil
         callback?(reason)
+    }
+}
+
+/// Local alarms while the watch loops alone. The iPhone's glucose alarms cannot sound while it is away.
+/// Thresholds come from the iPhone's glucose alarms in the copy (`glucoseAlerts`); without them
+/// 55 / 70 / 250 mg/dL are used. Everything here runs on the main thread.
+enum HandyFreiAlarm {
+    struct Limits {
+        var urgentLow: Double = 55
+        var low: Double = 70
+        var high: Double = 250
+        var urgentLowOn = true
+        var lowOn = true
+        var highOn = true
+    }
+
+    private static var lastFired: [String: Date] = [:]
+    private static var asked = false
+
+    static func requestPermission() {
+        guard !asked else { return }
+        asked = true
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    static func thresholds(_ files: [String: String]) -> Limits {
+        var limits = Limits()
+        guard let data = files["glucoseAlerts"]?.data(using: .utf8),
+              let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else { return limits }
+        for row in rows {
+            guard let type = row["type"] as? String,
+                  let threshold = (row["threshold"] as? NSNumber)?.doubleValue, threshold > 0
+            else { continue }
+            let enabled = (row["enabled"] as? Bool) ?? true
+            switch type {
+            case "urgentLow":
+                limits.urgentLow = threshold
+                limits.urgentLowOn = enabled
+            case "low":
+                limits.low = threshold
+                limits.lowOn = enabled
+            case "high":
+                limits.high = threshold
+                limits.highOn = enabled
+            default:
+                break
+            }
+        }
+        return limits
+    }
+
+    /// One new reading. Repeats while it stays out of range: urgent low every 5 minutes,
+    /// low every 15 minutes, high every hour. The urgent-low floor sounds even if the low alarm is off.
+    static func check(mgdl: Int, files: [String: String]) {
+        let bounds = thresholds(files)
+        let value = Double(mgdl)
+        if value <= max(bounds.urgentLow, 54), bounds.urgentLowOn || value < 55 {
+            fire("handyfrei.urgentLow", every: 5 * 60, title: "Dringend niedrig", body: "\(mgdl) mg/dL. Jetzt Kohlenhydrate.")
+        } else if bounds.lowOn, value <= bounds.low {
+            reset("handyfrei.urgentLow")
+            fire("handyfrei.low", every: 15 * 60, title: "Niedrig", body: "\(mgdl) mg/dL.")
+        } else {
+            reset("handyfrei.urgentLow")
+            reset("handyfrei.low")
+        }
+        if bounds.highOn, value >= bounds.high {
+            fire("handyfrei.high", every: 60 * 60, title: "Hoch", body: "\(mgdl) mg/dL.")
+        } else {
+            reset("handyfrei.high")
+        }
+    }
+
+    /// Haptic plus a local notification. The haptic also plays while the workout keeps the app in the background.
+    static func fire(_ id: String, every interval: TimeInterval, title: String, body: String) {
+        let now = Date()
+        if let last = lastFired[id], now.timeIntervalSince(last) < interval { return }
+        lastFired[id] = now
+        WKInterfaceDevice.current().play(id == "handyfrei.urgentLow" ? .failure : .notification)
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        content.threadIdentifier = "handyfrei"
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: nil)) { _ in }
+    }
+
+    /// The condition ended. The next one fires at once.
+    static func reset(_ id: String) {
+        lastFired[id] = nil
+    }
+
+    static func clear(_ id: String) {
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [id])
     }
 }

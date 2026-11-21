@@ -14,6 +14,10 @@ struct WatchHistoryLine: Identifiable, Equatable {
 /// WatchState manages the communication between the Watch app and the iPhone app using WatchConnectivity.
 /// It handles glucose data synchronization and sending treatment requests (bolus, carbs) to the phone.
 @Observable final class WatchState: NSObject, WCSessionDelegate {
+    /// One state for the whole app. A background relaunch (workout recovery) has no view yet,
+    /// so the app delegate and the main view must share this object.
+    static let shared = WatchState()
+
     // MARK: - Properties
 
     /// The WatchConnectivity session instance used for communication
@@ -62,6 +66,8 @@ struct WatchHistoryLine: Identifiable, Equatable {
     var handyFreiGlucoseDate: Date?
     /// When the last key snapshot arrived. A start without the phone uses this copy as-is.
     var handyFreiSnapshotAt: Date?
+    /// Set when Handy-frei started from a copy older than 30 minutes: no SMB and no temp above basal until then.
+    var handyFreiHoldUntil: Date?
     /// Last loop time, determination, and pump result. Sensor packets do not overwrite this.
     var handyFreiLoopLine = ""
     var handyFreiFiles: [String: String] = [:]
@@ -341,10 +347,16 @@ struct WatchHistoryLine: Identifiable, Equatable {
         let note = handyFrei["note"] as? String ?? "Handy-frei."
         let shadow = handyFrei["shadow"] as? String ?? ""
         let kind = handyFrei["kind"] as? String
+        let standby = kind == "standby"
         DispatchQueue.main.async {
-            self.handyFreiStatus = [note, shadow].filter { !$0.isEmpty }.joined(separator: " ")
+            // A standby copy only keeps the files current while Handy-frei is off.
+            // A running stretch keeps its own doses, autosens and adjustments.
+            if standby, self.handyFreiRunning { return }
+            if !standby {
+                self.handyFreiStatus = [note, shadow].filter { !$0.isEmpty }.joined(separator: " ")
+            }
             if let snapshot = handyFrei["snapshot"] as? [String: Any] {
-                self.handyFreiReadyToConfirm = true
+                if !standby { self.handyFreiReadyToConfirm = true }
                 self.handyFreiSnapshotAt = Date()
                 self.handyFreiBleAddress = snapshot["bleAddress"] as? String ?? ""
                 self.handyFreiSensorPeripheralID = snapshot["sensorPeripheralID"] as? String ?? ""
@@ -375,6 +387,7 @@ struct WatchHistoryLine: Identifiable, Equatable {
                 HandyFreiSession.HandyFreiDisk.saveSnapshot(self)
             }
             if kind == "watch-owns" {
+                HandyFreiSession.shared.freshCopyArrived(self)
                 if self.handyFreiRunning {
                     self.restartHandyFreiFromCache()
                 } else {

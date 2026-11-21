@@ -1091,6 +1091,16 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
     private func checkHandyFreiHandoff() {
         let cgm = fetchGlucoseManager.cgmManager
         HandyFreiPhone.bindLibre(cgm)
+        // Reachability callbacks arrive on a WatchConnectivity queue. The copy reads the pump
+        // manager like the hand-off does, on the main thread.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            HandyFreiPhone.pushStandbySnapshot(
+                pump: self.deviceDataManager.pumpManager,
+                cgm: self.fetchGlucoseManager.cgmManager,
+                storage: self.fileStorage
+            )
+        }
         guard HandyFreiPhone.radioIsHandedOff, let session, session.activationState == .activated else { return }
         guard session.isReachable else {
             HandyFreiPhone.noteWatch(reachable: false, running: nil, heartbeat: nil, cgm: cgm)

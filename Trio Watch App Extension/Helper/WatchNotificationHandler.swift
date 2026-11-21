@@ -28,6 +28,19 @@ final class WatchNotificationHandler: NSObject, UNUserNotificationCenterDelegate
         }
     }
 
+    /// Handy-frei alarms also show while Trio is open on the watch. Other notifications keep the old behaviour.
+    func userNotificationCenter(
+        _: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        if notification.request.identifier.hasPrefix("handyfrei.") {
+            completionHandler([.banner, .sound, .list])
+        } else {
+            completionHandler([])
+        }
+    }
+
     /// UNUserNotificationCenterDelegate method called when user interacts with a notification on watch.
     /// This can be called off the main thread. WCSession.transferUserInfo is thread-safe.
     func userNotificationCenter(

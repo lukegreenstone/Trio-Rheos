@@ -88,10 +88,41 @@ public final class HandyFreiMedtrumLink: NSObject, CBCentralManagerDelegate, CBP
         case .unsupported:
             finishConnect(.failure(HandyFreiLinkError.bluetoothUnsupported))
         case .poweredOn:
-            central?.scanForPeripherals(withServices: nil)
+            if let central { connectKnownOrScan(central) }
         default:
             break
         }
+    }
+
+    private static let peripheralKey = "handyfrei.medtrumPeripheral"
+
+    /// The patch seen last time, stored with its serial so a new patch is never mistaken for it.
+    private func knownPeripheralID() -> UUID? {
+        guard let stored = UserDefaults.standard.string(forKey: Self.peripheralKey) else { return nil }
+        let parts = stored.split(separator: "|").map(String.init)
+        guard parts.count == 2, parts[1] == serialHex else { return nil }
+        return UUID(uuidString: parts[0])
+    }
+
+    private func rememberPeripheral(_ id: UUID) {
+        UserDefaults.standard.set("\(id.uuidString)|\(serialHex)", forKey: Self.peripheralKey)
+    }
+
+    private var serialHex: String {
+        pumpSN.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// A known patch is connected directly: a pending connect has no timeout, uses little power and
+    /// completes as soon as the patch is in range. The scan still runs beside it, for a new patch.
+    private func connectKnownOrScan(_ central: CBCentralManager) {
+        if peripheral == nil, let known = knownPeripheralID(),
+           let match = central.retrievePeripherals(withIdentifiers: [known]).first
+        {
+            peripheral = match
+            match.delegate = self
+            central.connect(match)
+        }
+        central.scanForPeripherals(withServices: nil)
     }
 
     private func failPowerIfStillWaiting() {
@@ -170,7 +201,7 @@ public final class HandyFreiMedtrumLink: NSObject, CBCentralManagerDelegate, CBP
         lastPower = central.state
         switch central.state {
         case .poweredOn:
-            central.scanForPeripherals(withServices: nil)
+            connectKnownOrScan(central)
         case .poweredOff:
             finishConnect(.failure(HandyFreiLinkError.bluetoothOff))
         case .unauthorized:
@@ -195,13 +226,22 @@ public final class HandyFreiMedtrumLink: NSObject, CBCentralManagerDelegate, CBP
               manufacturer.subdata(in: 2 ..< 6) == advertisedSN
         else { return }
         central.stopScan()
+        rememberPeripheral(peripheral.identifier)
+        // The direct connect to the stored patch may already be pending for this same peripheral.
+        guard self.peripheral?.identifier != peripheral.identifier else { return }
+        if let pending = self.peripheral {
+            central.cancelPeripheralConnection(pending)
+        }
         self.peripheral = peripheral
         peripheral.delegate = self
         central.connect(peripheral)
     }
 
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        guard central === self.central else { return }
+        // A late connect from a peripheral that was already replaced is ignored.
+        guard central === self.central, peripheral.identifier == self.peripheral?.identifier else { return }
+        central.stopScan()
+        rememberPeripheral(peripheral.identifier)
         peripheral.discoverServices([CBUUID.SERVICE_UUID])
     }
 
@@ -300,8 +340,9 @@ public final class HandyFreiMedtrumLink: NSObject, CBCentralManagerDelegate, CBP
         }
     }
 
-    public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral _: CBPeripheral, error _: Error?) {
-        guard central === self.central, !stopping else { return }
+    public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral disconnected: CBPeripheral, error _: Error?) {
+        // A cancelled connect to an older patch reports here too. Only the current patch counts.
+        guard central === self.central, !stopping, disconnected.identifier == peripheral?.identifier else { return }
         fail(HandyFreiLinkError.notFound)
         if ready { onConnectionLost?() }
     }

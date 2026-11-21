@@ -243,7 +243,69 @@ enum HandyFreiPhone {
         let presets = livePresets()
         files["overridePresets"] = presets.overrides
         files["tempTargetPresets"] = presets.targets
+        files["glucoseAlerts"] = glucoseAlertsJSON()
         return files
+    }
+
+    /// The iPhone's glucose alarm thresholds, one row per type, so the watch can alarm on its own.
+    /// Several alarms of one type collapse to the most protective threshold that is switched on.
+    private static func glucoseAlertsJSON() -> String {
+        var rows: [String: [String: Any]] = [:]
+        for alert in GlucoseAlertsStore.shared.alerts {
+            let type = alert.type.rawValue
+            let threshold = NSDecimalNumber(decimal: alert.thresholdMgDL).doubleValue
+            guard threshold > 0 else { continue }
+            let lowSide = alert.type == .urgentLow || alert.type == .low
+            if let existing = rows[type], let old = existing["threshold"] as? Double, existing["enabled"] as? Bool == true {
+                guard alert.isEnabled else { continue }
+                let better = lowSide ? threshold > old : threshold < old
+                if !better { continue }
+            }
+            rows[type] = ["type": type, "threshold": threshold, "enabled": alert.isEnabled]
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: Array(rows.values)),
+              let text = String(data: data, encoding: .utf8) else { return "" }
+        return text
+    }
+
+    private static var lastStandbyPush = Date.distantPast
+
+    /// Keeps the watch copy current while the iPhone loops, so a later start without the iPhone
+    /// begins from recent pump history and does not need the four-hour hold. Sent every 10 minutes,
+    /// only to a reachable watch, and never while Handy-frei runs. The watch ignores it while running.
+    static func pushStandbySnapshot(pump: Any?, cgm: Any?, storage: FileStorage?) {
+        guard HandyFrei.isEnabled(), !radioIsHandedOff, !HandyFreiGate.phoneLoopPaused, !awaitingImport else { return }
+        guard Date().timeIntervalSince(lastStandbyPush) >= 10 * 60, WCSession.isSupported() else { return }
+        let link = WCSession.default
+        guard link.activationState == .activated, link.isReachable, link.isWatchAppInstalled else { return }
+        lastStandbyPush = Date()
+        let document = RheosStore.shared.loadDocument()
+        let learned = document.decision?.learnedFactors ?? document.applied?.factors
+        let snapshot = collectSnapshot(
+            pump: pump,
+            cgm: cgm,
+            iob: 0,
+            cob: 0,
+            maxBolus: 0,
+            maxIOB: 0,
+            rheosBasal: learned?.basal ?? [],
+            rheosISF: learned?.isf ?? [],
+            rheosCarbRatio: learned?.carbRatio ?? [],
+            loopFiles: loopFiles(storage: storage),
+            glucose: nil
+        )
+        guard snapshot.refusal == nil else { return }
+        let payload: [String: Any] = ["kind": "standby", "note": "", "ownsRadio": false, "snapshot": snapshot.plist]
+        let message: [String: Any] = ["handyFrei": payload]
+        link.sendMessage(message, replyHandler: nil) { _ in
+            // Too large for a message: queue it, replacing an older standby copy that is still waiting.
+            for transfer in link.outstandingUserInfoTransfers {
+                if let queued = transfer.userInfo["handyFrei"] as? [String: Any], queued["kind"] as? String == "standby" {
+                    transfer.cancel()
+                }
+            }
+            link.transferUserInfo(message)
+        }
     }
 
     private static func livePresets() -> (overrides: String, targets: String) {
