@@ -356,6 +356,13 @@ final class HandyFreiSession {
                 return
             }
             guard state.handyFreiRunning, epoch == self.doseEpoch else { return }
+            let missing = self.missingKeys()
+            if !missing.isEmpty {
+                let text = "Schlüssel fehlen: \(missing.joined(separator: ", ")). iPhone in die Nähe, Trio dort öffnen, dann Handy-frei beenden und neu aktivieren."
+                await self.mark(state, text)
+                self.giveUpOrRetry(state, text)
+                return
+            }
             do {
                 try await self.openPump(state, attempt: 1)
                 guard state.handyFreiRunning, epoch == self.doseEpoch else {
@@ -1032,8 +1039,28 @@ final class HandyFreiSession {
     }
 
     /// Shown between determinations. This is not a failure.
+    /// Which keys from the iPhone copy are missing. Without them neither pump nor sensor can connect.
+    private func missingKeys() -> [String] {
+        var missing: [String] = []
+        if (Data(base64Encoded: pumpSerial) ?? Data()).isEmpty { missing.append("Pumpen-Seriennummer") }
+        if (Data(base64Encoded: sessionToken) ?? Data()).isEmpty { missing.append("Pumpen-Token") }
+        if address.filter(\.isHexDigit).count < 12 { missing.append("Sensor-Adresse") }
+        if pin.count != 4 { missing.append("Sensor-PIN") }
+        if phase5.count != 16 { missing.append("Sensor-Schlüssel") }
+        return missing
+    }
+
+    /// An old reading carries its age, so a value from the last session does not look current.
+    private func readingText(_ mgdl: Int) -> String {
+        guard let newest = readings.map(\.date).max() else { return "\(mgdl) mg/dL" }
+        let age = Date().timeIntervalSince(newest)
+        guard age > 6 * 60 else { return "\(mgdl) mg/dL" }
+        let minutes = Int(age / 60)
+        return minutes < 120 ? "\(mgdl) mg/dL vor \(minutes) min" : "\(mgdl) mg/dL vor \(minutes / 60) h"
+    }
+
     private func showWaiting(_ state: WatchState, mgdl: Int, remain: Int) {
-        let line = "\(Self.clockMinute()) \(mgdl) mg/dL · nächster Loop in \(remain)s · \(lastReason)"
+        let line = "\(Self.clockMinute()) \(readingText(mgdl)) · nächster Loop in \(remain)s · \(lastReason)"
         state.handyFreiGlucose = mgdl
         state.handyFreiStatus = line
         state.handyFreiLoopLine = line

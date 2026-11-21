@@ -345,6 +345,12 @@ struct WatchHistoryLine: Identifiable, Equatable {
         handleIncomingWatchStatePayload(userInfo)
     }
 
+    /// The incoming key when it has a value, otherwise the one already stored.
+    private static func keep(_ current: String, _ incoming: Any?) -> String {
+        guard let value = incoming as? String, !value.isEmpty else { return current }
+        return value
+    }
+
     /// Snapshot from the iPhone. Secrets stay in memory for the reconnect and are not written to the log.
     private func absorbHandyFrei(_ message: [String: Any]) {
         guard let handyFrei = message["handyFrei"] as? [String: Any] else { return }
@@ -362,13 +368,15 @@ struct WatchHistoryLine: Identifiable, Equatable {
             if let snapshot = handyFrei["snapshot"] as? [String: Any] {
                 if !standby { self.handyFreiReadyToConfirm = true }
                 self.handyFreiSnapshotAt = Date()
-                self.handyFreiBleAddress = snapshot["bleAddress"] as? String ?? ""
-                self.handyFreiSensorPeripheralID = snapshot["sensorPeripheralID"] as? String ?? ""
-                self.handyFreiBlePIN = snapshot["blePIN"] as? String ?? ""
-                self.handyFreiPhase5 = snapshot["phase5RawKey"] as? String ?? ""
-                self.handyFreiPumpSerial = snapshot["pumpSerial"] as? String ?? ""
-                    self.handyFreiSessionToken = snapshot["sessionToken"] as? String ?? ""
-                    self.handyFreiBackupToken = snapshot["backupSessionToken"] as? String ?? ""
+                // A copy without a key (the iPhone had not loaded the sensor or pump yet) must not
+                // blank the key the watch already has. A new sensor or patch brings new values.
+                self.handyFreiBleAddress = Self.keep(self.handyFreiBleAddress, snapshot["bleAddress"])
+                self.handyFreiSensorPeripheralID = Self.keep(self.handyFreiSensorPeripheralID, snapshot["sensorPeripheralID"])
+                self.handyFreiBlePIN = Self.keep(self.handyFreiBlePIN, snapshot["blePIN"])
+                self.handyFreiPhase5 = Self.keep(self.handyFreiPhase5, snapshot["phase5RawKey"])
+                self.handyFreiPumpSerial = Self.keep(self.handyFreiPumpSerial, snapshot["pumpSerial"])
+                self.handyFreiSessionToken = Self.keep(self.handyFreiSessionToken, snapshot["sessionToken"])
+                self.handyFreiBackupToken = Self.keep(self.handyFreiBackupToken, snapshot["backupSessionToken"])
                 let files = Self.stringMap(snapshot["loopFiles"])
                 if !files.isEmpty { self.handyFreiFiles = files }
                 let basal = Self.doubles(snapshot["rheosBasal"])

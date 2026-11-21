@@ -270,6 +270,13 @@ enum HandyFreiPhone {
 
     private static var lastStandbyPush = Date.distantPast
 
+    /// Everything the watch needs to loop alone: Medtrum serial and session token, Libre address,
+    /// PIN and phase-5 key.
+    private static func hasAllKeys(_ snapshot: HandyFrei.Snapshot) -> Bool {
+        let keys = [snapshot.pumpSerial, snapshot.sessionToken, snapshot.bleAddress, snapshot.blePIN, snapshot.phase5RawKey]
+        return keys.allSatisfy { !($0 ?? "").isEmpty }
+    }
+
     /// Keeps the watch copy current while the iPhone loops, so a later start without the iPhone
     /// begins from recent pump history and does not need the four-hour hold. Sent every 10 minutes,
     /// only to a reachable watch, and never while Handy-frei runs. The watch ignores it while running.
@@ -294,7 +301,12 @@ enum HandyFreiPhone {
             loopFiles: loopFiles(storage: storage),
             glucose: nil
         )
-        guard snapshot.refusal == nil else { return }
+        // Right after a launch the pump or the Libre manager may not be loaded yet. Such a copy
+        // has no keys and is not sent; the next timer tick tries again.
+        guard snapshot.refusal == nil, hasAllKeys(snapshot) else {
+            lastStandbyPush = .distantPast
+            return
+        }
         let payload: [String: Any] = ["kind": "standby", "note": "", "ownsRadio": false, "snapshot": snapshot.plist]
         let message: [String: Any] = ["handyFrei": payload]
         link.sendMessage(message, replyHandler: nil) { _ in

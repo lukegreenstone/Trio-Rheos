@@ -109,7 +109,7 @@ public enum HandyFreiLoop {
     ) -> Outcome {
         let empty = Outcome(
             deliver: false, cancelTemp: false, setTemp: false, rate: 0, minutes: 0, smb: 0,
-            reason: "Schatten. Eingaben fehlen.", iob: 0, maxIOB: 0, maxBolus: 0, maxBasal: 0, cob: 0, failed: false
+            reason: "Kein Glukosewert der letzten 24 h. Kein Insulin.", iob: 0, maxIOB: 0, maxBolus: 0, maxBasal: 0, cob: 0, failed: false
         )
         let points = combinedGlucose(files: files, watch: glucose, directions: directions)
         guard let newest = points.max(by: { $0.dateString < $1.dateString }) else { return empty }
