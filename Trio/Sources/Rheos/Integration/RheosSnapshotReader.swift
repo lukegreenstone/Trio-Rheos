@@ -65,9 +65,20 @@ enum RheosSnapshotReader {
                     let smb = row.bolus?.isSMB == true || row.type == PumpEventStored.EventType.smb.rawValue
                     return RheosInsulinEvent(date: date, units: amount, kind: smb ? "smb" : "bolus")
                 }
-                if let delivered = row.tempBasal?.deliveredUnits?.doubleValue, delivered > 0 {
-                    let scheduled = row.tempBasal?.isScheduledBasal == true
-                    return RheosInsulinEvent(date: date, units: delivered, kind: scheduled ? "scheduledBasal" : "tempBasal")
+                if let temp = row.tempBasal {
+                    let scheduled = temp.isScheduledBasal
+                    let delivered = temp.deliveredUnits?.doubleValue ?? 0
+                    let rate = temp.rate?.doubleValue
+                    // Zero temps are kept as well (0 units): they mark the time the loop stopped basal,
+                    // which the delivered-basal estimate needs.
+                    guard delivered > 0 || (!scheduled && rate != nil) else { return nil }
+                    return RheosInsulinEvent(
+                        date: date,
+                        units: max(0, delivered),
+                        kind: scheduled ? "scheduledBasal" : "tempBasal",
+                        rate: scheduled ? nil : rate,
+                        minutes: scheduled ? nil : Double(temp.duration)
+                    )
                 }
                 return nil
             }

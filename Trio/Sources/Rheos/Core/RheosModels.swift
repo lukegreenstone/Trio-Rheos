@@ -178,6 +178,9 @@ struct RheosInsulinEvent: Codable, Equatable {
     var date: Date
     var units: Double
     var kind: String
+    /// Temp basals only: programmed rate (U/h) and duration (minutes). Older files have neither.
+    var rate: Double? = nil
+    var minutes: Double? = nil
 }
 
 struct RheosMealEvent: Codable, Equatable, Identifiable {

@@ -76,6 +76,7 @@ final class RheosCoordinator {
             autosensMax: autosensMax(),
             targets: targets,
             scharfSince: Date(),
+            scheduledBasal: scheduledBasalByHour(),
             now: Date()
         )
         let step = RheosRamp.maxStep(now: Date(), scharfSince: Date(), bounds: bounds, calendar: .current)
@@ -156,6 +157,7 @@ final class RheosCoordinator {
             wake: store.loadDocument().wake,
             sites: store.patchSites(),
             lateDigestion: store.loadDocument().lateDigestion,
+            scheduledBasal: scheduledBasalByHour(),
             now: now
         )
         store.saveDecision(decision)
@@ -393,6 +395,22 @@ final class RheosCoordinator {
             changed = true
         }
         if changed { RheosStore.shared.saveDocument(state) }
+    }
+
+    /// The pump's scheduled basal per clock hour (U/h, mean of the hour), from Trio's basal file.
+    /// Empty when there is no file, which leaves the delivered-basal estimate out.
+    private func scheduledBasalByHour() -> [Double] {
+        let profile = resolver.resolve(FileStorage.self)?
+            .retrieve(OpenAPS.Settings.basalProfile, as: [BasalProfileEntry].self) ?? []
+        let sorted = profile.sorted { $0.minutes < $1.minutes }
+        guard let latest = sorted.last else { return [] }
+        func rate(atMinute minute: Int) -> Double {
+            let entry = sorted.last(where: { $0.minutes <= minute }) ?? latest
+            return NSDecimalNumber(decimal: entry.rate).doubleValue
+        }
+        return (0 ..< 24).map { hour in
+            [0, 15, 30, 45].map { rate(atMinute: hour * 60 + $0) }.reduce(0, +) / 4
+        }
     }
 
     func basalProposal() -> RheosBasalProposal {

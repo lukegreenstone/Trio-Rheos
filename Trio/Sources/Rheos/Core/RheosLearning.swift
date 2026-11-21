@@ -20,6 +20,7 @@ enum RheosLearner {
         wake: RheosWakeState? = nil,
         sites: [RheosPatchSite] = [],
         lateDigestion: [RheosLateDigestion] = [],
+        scheduledBasal: [Double] = [],
         now: Date,
         calendar: Calendar = .current
     ) -> RheosProfileDecision {
@@ -53,6 +54,7 @@ enum RheosLearner {
             targets: targets,
             band: band,
             acceptedSignals: acceptedSignals,
+            scheduledBasal: scheduledBasal,
             calendar: calendar
         )
         let learned = RheosDynamicISF.neutralize(fitted, dynamicISFOn: dynamicISFOn)
@@ -207,6 +209,7 @@ enum RheosLearner {
         targets: RheosTargetSchedule,
         band: ClosedRange<Double>,
         acceptedSignals: [String] = [],
+        scheduledBasal: [Double] = [],
         calendar: Calendar
     ) -> RheosHourlyFactors {
         let observations = RheosFit.observations(dataset: dataset, targets: targets, calendar: calendar)
@@ -227,6 +230,14 @@ enum RheosLearner {
             model.factors.isf = core.factors.isf
         }
         model.factors.carbRatio = RheosFit.carbRatioFactors(dataset: dataset, targets: targets, band: band, calendar: calendar)
+        // In a closed loop the pump's delivery is the stronger basal signal. Where it is consistent,
+        // it replaces the glucose-level estimate for that hour.
+        let delivered = RheosDeliveredBasal.factors(dataset: dataset, scheduledBasal: scheduledBasal, calendar: calendar)
+        for hour in 0 ..< 24 {
+            if let value = delivered[hour] {
+                model.factors.basal[hour] = min(max(value, band.lowerBound), band.upperBound)
+            }
+        }
         return model.factors
     }
 

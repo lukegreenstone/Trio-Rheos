@@ -68,6 +68,10 @@ struct WatchHistoryLine: Identifiable, Equatable {
     var handyFreiSnapshotAt: Date?
     /// Set when Handy-frei started from a copy older than 30 minutes: no SMB and no temp above basal until then.
     var handyFreiHoldUntil: Date?
+    /// Name of the training running in Trio's workout, empty for the plain keep-alive.
+    var handyFreiTraining = ""
+    /// Another app's workout ended Handy-frei's session. The user restarts it after that training.
+    var handyFreiYielded = false
     /// Last loop time, determination, and pump result. Sensor packets do not overwrite this.
     var handyFreiLoopLine = ""
     var handyFreiFiles: [String: String] = [:]

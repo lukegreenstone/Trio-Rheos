@@ -514,6 +514,27 @@ final class RheosCoreTests: XCTestCase {
         XCTAssertGreaterThan(at100.learnedFactors.basal[8], at120.learnedFactors.basal[8])
     }
 
+    func testDeliveredInsulinTeachesBasalInQuietHours() {
+        var glucose: [RheosGlucosePoint] = []
+        var insulin: [RheosInsulinEvent] = []
+        for day in 1 ... 10 {
+            for hour in 0 ..< 24 {
+                for minute in stride(from: 0, to: 60, by: 5) {
+                    glucose.append(RheosGlucosePoint(date: date(day: day, hour: hour, minute: minute), mgdl: 110))
+                }
+            }
+            // The loop ran 1.5 U/h for the whole 3 o'clock hour on a 1 U/h schedule.
+            insulin.append(RheosInsulinEvent(date: date(day: day, hour: 3), units: 1.5, kind: "tempBasal", rate: 1.5, minutes: 60))
+        }
+        let factors = RheosDeliveredBasal.factors(
+            dataset: RheosDataset(glucose: glucose, insulin: insulin),
+            scheduledBasal: Array(repeating: 1, count: 24),
+            calendar: calendar
+        )
+        XCTAssertGreaterThan(factors[3] ?? 0, 1.3)
+        XCTAssertEqual(factors[10] ?? 0, 1, accuracy: 0.001)
+    }
+
     func testRheosTimesAutosensStaysInsideTheAutosensLimits() {
         let strong = RheosHourlyFactors(
             basal: Array(repeating: 1.2, count: 24),

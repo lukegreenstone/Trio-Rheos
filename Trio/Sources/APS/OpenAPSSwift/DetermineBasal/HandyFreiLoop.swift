@@ -22,6 +22,11 @@ public enum HandyFreiLoop {
         public var cob: Double
         /// True only when determine-basal threw. A busy or throttled minute is not a failure.
         public var failed: Bool
+        /// Lowest predicted glucose in 20 minutes across the IOB, COB, UAM and ZT curves,
+        /// the same horizon and rule as the iPhone's forecasted-low alarm.
+        public var forecast20: Double? = nil
+        /// Grams determine-basal asks for to avoid a low.
+        public var carbsRequired: Double = 0
     }
 
     public struct WatchCarb: Equatable {
@@ -285,7 +290,9 @@ public enum HandyFreiLoop {
                 maxBolus: maxBolus,
                 maxBasal: NSDecimalNumber(decimal: settings.maxBasal).doubleValue,
                 cob: NSDecimalNumber(decimal: meal?.mealCOB ?? 0).doubleValue,
-                failed: false
+                failed: false,
+                forecast20: forecast20(determination?.predictions),
+                carbsRequired: max(0, NSDecimalNumber(decimal: determination?.carbsReq ?? 0).doubleValue)
             )
         } catch {
             var failed = empty
@@ -294,6 +301,17 @@ public enum HandyFreiLoop {
             failed.reason = "Bestimmung fehlgeschlagen: \(brief(error))"
             return failed
         }
+    }
+
+    /// Index 4 of the 5-minute curves is +20 minutes, as in ForecastedGlucoseEvaluator.
+    private static func forecast20(_ predictions: Predictions?) -> Double? {
+        guard let predictions else { return nil }
+        let curves = [predictions.iob, predictions.cob, predictions.uam, predictions.zt]
+        let values = curves.compactMap { curve -> Double? in
+            guard let curve, curve.indices.contains(4) else { return nil }
+            return Double(curve[4])
+        }
+        return values.min()
     }
 
     public static func snapshotReadings(_ files: [String: String]) -> [(date: Date, mgdl: Int)] {

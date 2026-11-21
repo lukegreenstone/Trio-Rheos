@@ -255,7 +255,7 @@ enum HandyFreiPhone {
             let type = alert.type.rawValue
             let threshold = NSDecimalNumber(decimal: alert.thresholdMgDL).doubleValue
             guard threshold > 0 else { continue }
-            let lowSide = alert.type == .urgentLow || alert.type == .low
+            let lowSide = alert.type == .urgentLow || alert.type == .low || alert.type == .forecastedLow
             if let existing = rows[type], let old = existing["threshold"] as? Double, existing["enabled"] as? Bool == true {
                 guard alert.isEnabled else { continue }
                 let better = lowSide ? threshold > old : threshold < old

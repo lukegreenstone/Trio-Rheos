@@ -10,6 +10,8 @@ import WatchKit
 struct HandyFreiWatchView: View {
     @Bindable var state: WatchState
     @State private var showingAdjustments = false
+    @State private var showingTraining = false
+    @State private var sportTarget = true
     @State private var customTarget = 110.0
     @State private var customMinutes = 60.0
 
@@ -28,6 +30,14 @@ struct HandyFreiWatchView: View {
                     Text(state.handyFreiAlarm)
                         .font(.footnote)
                         .foregroundStyle(.orange)
+                }
+                if state.handyFreiRunning, state.handyFreiYielded {
+                    Text("Eine andere App hat ein Training gestartet. Handy-frei pausiert, die Pumpe fällt auf ihr Basal zurück.")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                    Button("Handy-frei-Workout wieder starten") {
+                        Task { await HandyFreiSession.shared.resumeAfterForeignWorkout(state) }
+                    }
                 }
                 if state.handyFreiRunning, let hold = state.handyFreiHoldUntil {
                     Text("Vorsicht bis \(hold.formatted(date: .omitted, time: .shortened)): Die Kopie war beim Start alt. Kein SMB und kein Extra-Basal, Absenken läuft weiter.")
@@ -63,6 +73,20 @@ struct HandyFreiWatchView: View {
                     if showingAdjustments {
                         adjustments
                     }
+                    if state.handyFreiTraining.isEmpty {
+                        Button(showingTraining ? "Training schließen" : "Training starten") {
+                            showingTraining.toggle()
+                        }
+                        if showingTraining {
+                            trainingList
+                        }
+                    } else {
+                        Text("Training: \(state.handyFreiTraining). Der Loop läuft im selben Workout weiter.")
+                            .font(.footnote)
+                        Button("Training beenden und speichern") {
+                            Task { await HandyFreiSession.shared.endTraining(state) }
+                        }
+                    }
                 }
                 if let copied = state.handyFreiSnapshotAt {
                     let hours = Int(Date().timeIntervalSince(copied) / 3600)
@@ -78,6 +102,23 @@ struct HandyFreiWatchView: View {
         }
         .sheet(isPresented: $state.showingMealPresets) {
             MealPresetListView(state: state)
+        }
+    }
+
+    private var trainingList: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("watchOS erlaubt nur ein Workout. Hier gestartet, loopt Trio darin weiter und speichert das Training in Health. In der Workout-App gestartet, pausiert Handy-frei.")
+                .font(.footnote)
+            if HandyFreiLoop.savedTempTargets(state.handyFreiFiles).contains(where: { $0.name.lowercased() == "sport" }) {
+                Toggle("Temp-Ziel „Sport“ dazu", isOn: $sportTarget)
+                    .font(.footnote)
+            }
+            ForEach(HandyFreiTraining.all, id: \.name) { training in
+                Button(training.name) {
+                    showingTraining = false
+                    Task { await HandyFreiSession.shared.startTraining(state, training, sportTarget: sportTarget) }
+                }
+            }
         }
     }
 
@@ -218,6 +259,9 @@ final class HandyFreiSession {
     private var bolusUncertain = false
     /// Under 10 % battery: the loop only lowers insulin.
     private var lowBattery = false
+    /// Another app started a workout. Restarting ours would end that training, so the watch waits
+    /// until Trio is opened again.
+    private var yieldedToForeignWorkout = false
     private var determining = false
     private var lastSuccess = Date.distantPast
     private var lastReason = "Loop wartet auf den ersten Wert."
@@ -242,6 +286,8 @@ final class HandyFreiSession {
         let resuming = HandyFreiDisk.wasActive()
         state.handyFreiRunning = true
         HandyFreiAlarm.requestPermission()
+        yieldedToForeignWorkout = false
+        state.handyFreiYielded = false
         doseEpoch += 1
         backoffTask?.cancel()
         backoffTask = nil
@@ -369,6 +415,46 @@ final class HandyFreiSession {
         state.handyFreiHoldUntil = nil
         log.append(["date": Date().timeIntervalSince1970, "kind": "stage", "text": "Vorsicht aufgehoben."])
         HandyFreiDisk.save(session: self, urgent: true)
+    }
+
+    /// Runs a training in Handy-frei's own workout, so the loop keeps running during sport.
+    /// The saved temp target named "Sport" is started with it when asked.
+    @MainActor func startTraining(_ state: WatchState, _ training: HandyFreiTraining, sportTarget: Bool) async {
+        guard state.handyFreiRunning else { return }
+        let started = await HandyFreiWorkout.shared.startTraining(training.activity, name: training.name, outdoor: training.outdoor)
+        guard started else {
+            let detail = HandyFreiWorkout.shared.lastFailure
+            state.handyFreiStatus = detail.isEmpty ? "Training nicht gestartet." : "Training nicht gestartet. \(detail)"
+            if !HandyFreiWorkout.shared.isRunning { await keepAwake(state, reason: "Training nicht gestartet") }
+            return
+        }
+        yieldedToForeignWorkout = false
+        state.handyFreiYielded = false
+        state.handyFreiTraining = training.name
+        log.append(["date": Date().timeIntervalSince1970, "kind": "stage", "text": "Training \(training.name) gestartet."])
+        if sportTarget,
+           let preset = HandyFreiLoop.savedTempTargets(state.handyFreiFiles).first(where: { $0.name.lowercased() == "sport" })
+        {
+            startTempTarget(state, name: preset.name, target: preset.target, minutes: max(15, Int(preset.durationMinutes)))
+        }
+        HandyFreiDisk.save(session: self)
+    }
+
+    /// The other app's training is over. Starting Handy-frei's workout again would end it otherwise.
+    @MainActor func resumeAfterForeignWorkout(_ state: WatchState) async {
+        yieldedToForeignWorkout = false
+        state.handyFreiYielded = false
+        await keepAwake(state, reason: "Nach dem Training in einer anderen App")
+    }
+
+    @MainActor func endTraining(_ state: WatchState) async {
+        let name = state.handyFreiTraining
+        let back = await HandyFreiWorkout.shared.endTraining()
+        state.handyFreiTraining = ""
+        log.append(["date": Date().timeIntervalSince1970, "kind": "stage", "text": "Training \(name) beendet und in Health gespeichert."])
+        state.handyFreiStatus = "Training \(name) gespeichert. Handy-frei läuft weiter."
+        if !back { await keepAwake(state, reason: "Nach dem Training") }
+        HandyFreiDisk.save(session: self)
     }
 
     /// No insulin once the newest reading is older than 12 minutes. The session stays up.
@@ -649,7 +735,27 @@ final class HandyFreiSession {
     /// in the foreground the next wake starts the workout again.
     @MainActor private func keepAwake(_ state: WatchState, reason: String) async {
         guard state.handyFreiRunning else { return }
+        state.handyFreiTraining = HandyFreiWorkout.shared.trainingName ?? ""
         if HandyFreiWorkout.shared.isRunning { return }
+        if reason == HandyFreiWorkout.foreignReason {
+            yieldedToForeignWorkout = true
+            log.append(["date": Date().timeIntervalSince1970, "kind": "stage", "text": "Workout an eine andere App abgegeben."])
+            state.handyFreiStatus = "Training in einer anderen App. Handy-frei pausiert, die Pumpe fällt auf ihr Basal zurück. Nach dem Training Trio öffnen."
+        }
+        if yieldedToForeignWorkout {
+            // Restarting here would end the other app's training. The user restarts it on the
+            // Handy-frei screen once that training is over.
+            state.handyFreiYielded = true
+            if WKApplication.shared().applicationState != .active {
+                HandyFreiAlarm.fire(
+                    "handyfrei.workout",
+                    every: 30 * 60,
+                    title: "Handy-frei pausiert",
+                    body: "Eine andere App hat ein Training gestartet, watchOS erlaubt nur eins. Nach dem Training Trio öffnen und das Workout wieder starten."
+                )
+            }
+            return
+        }
         if Date().timeIntervalSince(lastWorkoutRestart) < 60 {
             try? await Task.sleep(nanoseconds: 5_000_000_000)
         }
@@ -1056,6 +1162,7 @@ final class HandyFreiSession {
         lastReason = outcome.reason
         lastIOB = outcome.iob
         lastCOB = outcome.cob
+        HandyFreiAlarm.checkForecast(outcome.forecast20, carbsRequired: outcome.carbsRequired, files: state.handyFreiFiles)
         let preview = "\(watched)\(Self.clockMinute()) \(mgdl) mg/dL · Temp \(String(format: "%.2f", outcome.rate)) U/h \(outcome.minutes) min · SMB \(String(format: "%.2f", outcome.smb)) U · \(outcome.reason)"
         state.handyFreiGlucose = mgdl
         state.handyFreiStatus = preview
@@ -1340,6 +1447,8 @@ final class HandyFreiSession {
         active = false
         HandyFreiDisk.save(session: self)
         state.handyFreiRunning = false
+        state.handyFreiTraining = ""
+        state.handyFreiYielded = false
         HandyFreiWorkout.shared.stop()
         HandyFreiLibreLink.stop()
         Task {
@@ -1472,6 +1581,8 @@ final class HandyFreiSession {
         doseEpoch += 1
         state.handyFreiRunning = false
         state.handyFreiAlarm = text
+        state.handyFreiTraining = ""
+        state.handyFreiYielded = false
         WKInterfaceDevice.current().play(.notification)
         log.append([
             "date": Date().timeIntervalSince1970,
@@ -2014,20 +2125,38 @@ final class HandyFreiWorkout: NSObject, HKWorkoutSessionDelegate, HKLiveWorkoutB
             return false
         }
         if await recover() { return true }
+        return await begin(activity: .other, location: .indoor, training: nil)
+    }
+
+    /// The training running in place of the keep-alive, or nil.
+    private(set) var trainingName: String?
+
+    /// Ends this session when another app (the Workout app) starts a workout. watchOS runs one at a time.
+    static let foreignReason = "Training in einer anderen App"
+
+    /// Starts a session. The keep-alive (`training == nil`) collects nothing and is never saved.
+    /// A training collects heart rate and energy and is saved to Health when it ends.
+    @MainActor private func begin(
+        activity: HKWorkoutActivityType,
+        location: HKWorkoutSessionLocationType,
+        training: String?
+    ) async -> Bool {
         let configuration = HKWorkoutConfiguration()
-        configuration.activityType = .other
-        configuration.locationType = .indoor
+        configuration.activityType = activity
+        configuration.locationType = location
         do {
             let session = try HKWorkoutSession(healthStore: store, configuration: configuration)
             let builder = session.associatedWorkoutBuilder()
             builder.delegate = self
             let source = HKLiveWorkoutDataSource(healthStore: store, workoutConfiguration: configuration)
-            // The workout only keeps the app running. The loop needs neither heart rate nor energy,
-            // and continuous workout heart rate is the largest battery cost of a day-long session.
-            let unused: [HKQuantityTypeIdentifier] = [.heartRate, .activeEnergyBurned, .basalEnergyBurned]
-            for identifier in unused {
-                if let type = HKQuantityType.quantityType(forIdentifier: identifier) {
-                    source.disableCollection(for: type)
+            if training == nil {
+                // The keep-alive only keeps the app running. The loop needs neither heart rate nor
+                // energy, and continuous workout heart rate is the largest battery cost of a long day.
+                let unused: [HKQuantityTypeIdentifier] = [.heartRate, .activeEnergyBurned, .basalEnergyBurned]
+                for identifier in unused {
+                    if let type = HKQuantityType.quantityType(forIdentifier: identifier) {
+                        source.disableCollection(for: type)
+                    }
                 }
             }
             builder.dataSource = source
@@ -2035,6 +2164,7 @@ final class HandyFreiWorkout: NSObject, HKWorkoutSessionDelegate, HKLiveWorkoutB
             session.delegate = self
             self.session = session
             self.builder = builder
+            trainingName = training
             let started = Date()
             session.startActivity(with: started)
             do {
@@ -2042,9 +2172,9 @@ final class HandyFreiWorkout: NSObject, HKWorkoutSessionDelegate, HKLiveWorkoutB
             } catch {
                 lastFailure = "Sammlung: \(error.localizedDescription)"
                 ignoreEnd = true
-                self.onEnd = nil
                 self.session = nil
                 self.builder = nil
+                trainingName = nil
                 session.end()
                 return false
             }
@@ -2056,18 +2186,61 @@ final class HandyFreiWorkout: NSObject, HKWorkoutSessionDelegate, HKLiveWorkoutB
         }
     }
 
-    func stop() {
+    /// Replaces the keep-alive with a real training. Started here, the same session keeps the loop
+    /// alive and is saved to Health. If the training cannot start, the keep-alive starts again.
+    @MainActor func startTraining(_ activity: HKWorkoutActivityType, name: String, outdoor: Bool) async -> Bool {
+        await requestTrainingAccess()
+        endQuietly(save: trainingName != nil)
+        if await begin(activity: activity, location: outdoor ? .outdoor : .indoor, training: name) { return true }
+        let failure = lastFailure
+        _ = await begin(activity: .other, location: .indoor, training: nil)
+        lastFailure = failure
+        return false
+    }
+
+    /// Ends the training, saves it to Health and goes back to the keep-alive.
+    @MainActor func endTraining() async -> Bool {
+        guard trainingName != nil else { return isRunning }
+        endQuietly(save: true)
+        return await begin(activity: .other, location: .indoor, training: nil)
+    }
+
+    private func requestTrainingAccess() async {
+        var share: Set<HKSampleType> = [HKObjectType.workoutType()]
+        var read: Set<HKObjectType> = []
+        let types: [HKQuantityTypeIdentifier] = [
+            .heartRate, .activeEnergyBurned, .basalEnergyBurned, .distanceWalkingRunning, .distanceCycling
+        ]
+        for identifier in types {
+            if let type = HKQuantityType.quantityType(forIdentifier: identifier) {
+                share.insert(type)
+                read.insert(type)
+            }
+        }
+        try? await store.requestAuthorization(toShare: share, read: read)
+    }
+
+    /// Ends the current session without the restart callback. A training is saved, the keep-alive discarded.
+    private func endQuietly(save: Bool) {
         ignoreEnd = true
-        onEnd = nil
         let collected = builder
         let ending = session
         builder = nil
         session = nil
-        // Nothing is saved to Health. The builder is discarded once collection has ended.
-        collected?.endCollection(withEnd: Date()) { _, _ in
-            collected?.discardWorkout()
-        }
+        trainingName = nil
         ending?.end()
+        collected?.endCollection(withEnd: Date()) { _, _ in
+            if save {
+                collected?.finishWorkout { _, _ in }
+            } else {
+                collected?.discardWorkout()
+            }
+        }
+    }
+
+    func stop() {
+        onEnd = nil
+        endQuietly(save: trainingName != nil)
     }
 
     /// HealthKit calls these on its own queue. Session state is only changed on the main thread.
@@ -2091,8 +2264,9 @@ final class HandyFreiWorkout: NSObject, HKWorkoutSessionDelegate, HKLiveWorkoutB
     }
 
     func workoutSession(_ workoutSession: HKWorkoutSession, didFailWithError error: Error) {
+        let foreign = (error as? HKError)?.code == .errorAnotherWorkoutSessionStarted
         DispatchQueue.main.async {
-            self.reportEnd(workoutSession, error.localizedDescription)
+            self.reportEnd(workoutSession, foreign ? Self.foreignReason : error.localizedDescription)
         }
     }
 
@@ -2111,6 +2285,7 @@ final class HandyFreiWorkout: NSObject, HKWorkoutSessionDelegate, HKLiveWorkoutB
         onEnd = nil
         session = nil
         builder = nil
+        trainingName = nil
         callback?(reason)
     }
 }
@@ -2122,10 +2297,14 @@ enum HandyFreiAlarm {
     struct Limits {
         var urgentLow: Double = 55
         var low: Double = 70
-        var high: Double = 250
+        var high: Double = 270
+        var forecastLow: Double = 72
+        var carbs: Double = 10
         var urgentLowOn = true
         var lowOn = true
         var highOn = true
+        var forecastLowOn = true
+        var carbsOn = true
     }
 
     private static var lastFired: [String: Date] = [:]
@@ -2157,6 +2336,12 @@ enum HandyFreiAlarm {
             case "high":
                 limits.high = threshold
                 limits.highOn = enabled
+            case "forecastedLow":
+                limits.forecastLow = threshold
+                limits.forecastLowOn = enabled
+            case "carbsRequired":
+                limits.carbs = threshold
+                limits.carbsOn = enabled
             default:
                 break
             }
@@ -2185,6 +2370,21 @@ enum HandyFreiAlarm {
         }
     }
 
+    /// After each determination: a low within 20 minutes, and carbs the loop asks for.
+    static func checkForecast(_ forecast: Double?, carbsRequired: Double, files: [String: String]) {
+        let bounds = thresholds(files)
+        if bounds.forecastLowOn, let forecast, forecast <= bounds.forecastLow {
+            fire("handyfrei.forecastLow", every: 15 * 60, title: "Bald niedrig", body: "In 20 min etwa \(Int(forecast)) mg/dL.")
+        } else {
+            reset("handyfrei.forecastLow")
+        }
+        if bounds.carbsOn, carbsRequired >= bounds.carbs {
+            fire("handyfrei.carbs", every: 15 * 60, title: "Kohlenhydrate nötig", body: "Der Loop empfiehlt etwa \(Int(carbsRequired.rounded())) g.")
+        } else {
+            reset("handyfrei.carbs")
+        }
+    }
+
     /// Haptic plus a local notification. The haptic also plays while the workout keeps the app in the background.
     static func fire(_ id: String, every interval: TimeInterval, title: String, body: String) {
         let now = Date()
@@ -2207,4 +2407,22 @@ enum HandyFreiAlarm {
     static func clear(_ id: String) {
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [id])
     }
+}
+
+/// Trainings that run in Handy-frei's own workout. Swimming is left out: it needs water lock and lap settings.
+struct HandyFreiTraining {
+    let name: String
+    let activity: HKWorkoutActivityType
+    let outdoor: Bool
+
+    static let all: [HandyFreiTraining] = [
+        HandyFreiTraining(name: "Laufen", activity: .running, outdoor: true),
+        HandyFreiTraining(name: "Gehen", activity: .walking, outdoor: true),
+        HandyFreiTraining(name: "Radfahren", activity: .cycling, outdoor: true),
+        HandyFreiTraining(name: "Wandern", activity: .hiking, outdoor: true),
+        HandyFreiTraining(name: "Indoor-Rad", activity: .cycling, outdoor: false),
+        HandyFreiTraining(name: "Krafttraining", activity: .traditionalStrengthTraining, outdoor: false),
+        HandyFreiTraining(name: "HIIT", activity: .highIntensityIntervalTraining, outdoor: false),
+        HandyFreiTraining(name: "Anderes Training", activity: .other, outdoor: false)
+    ]
 }

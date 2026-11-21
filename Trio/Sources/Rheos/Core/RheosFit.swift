@@ -311,3 +311,102 @@ enum RheosFit {
         return best
     }
 }
+
+/// Closed-loop basal need from what the pump delivered. A closed loop hides a wrong basal: when it is
+/// too low the loop adds temps and SMBs and glucose still looks fine. In a quiet hour (no carbs for
+/// 4 hours, 8 after a fat-protein meal, no bolus for 3 hours, glucose within 70–180 and moving less
+/// than 15 mg/dL) the insulin that was delivered is what that hour needed: scheduled basal where no
+/// temp ran, the temps, and SMBs. Its ratio to the scheduled rate is the hour's basal factor.
+/// An hour is used only when the older and the newer half of its days agree.
+enum RheosDeliveredBasal {
+    static let minimumDays = 5
+    static let maximumDrift = 15.0
+    static let range = 70.0 ... 180.0
+    static let maximumDisagreement = 0.15
+
+    /// One factor per clock hour, nil where the data are thin or disagree. Not clamped to a band.
+    static func factors(dataset: RheosDataset, scheduledBasal: [Double], calendar: Calendar) -> [Double?] {
+        var result = [Double?](repeating: nil, count: 24)
+        guard scheduledBasal.count == 24, scheduledBasal.allSatisfy({ $0.isFinite && $0 > 0 }) else { return result }
+        let temps = dataset.insulin
+            .filter { $0.kind == "tempBasal" && $0.rate != nil && ($0.minutes ?? 0) > 0 }
+            .sorted { $0.date < $1.date }
+        guard !temps.isEmpty else { return result }
+        // A newer temp ends the one before it, as on the pump.
+        var spans: [(start: Date, end: Date, rate: Double)] = []
+        for (index, temp) in temps.enumerated() {
+            var end = temp.date.addingTimeInterval((temp.minutes ?? 0) * 60)
+            if index + 1 < temps.count { end = min(end, temps[index + 1].date) }
+            if end > temp.date { spans.append((temp.date, end, max(0, temp.rate ?? 0))) }
+        }
+        var smbByHour: [Date: Double] = [:]
+        for smb in dataset.insulin where smb.kind == "smb" {
+            if let key = calendar.dateInterval(of: .hour, for: smb.date)?.start {
+                smbByHour[key, default: 0] += smb.units
+            }
+        }
+        let boluses = dataset.insulin.filter { $0.kind == "bolus" }
+        let glucose = dataset.glucose.sorted { $0.date < $1.date }
+        guard let first = glucose.first?.date, let last = glucose.last?.date,
+              var hourStart = calendar.dateInterval(of: .hour, for: first)?.start
+        else { return result }
+        var byHour = [[(day: Date, ratio: Double)]](repeating: [], count: 24)
+        var glucoseCursor = 0
+        var spanCursor = 0
+        while hourStart.addingTimeInterval(3600) <= last {
+            let start = hourStart
+            let end = hourStart.addingTimeInterval(3600)
+            hourStart = end
+            while glucoseCursor < glucose.count, glucose[glucoseCursor].date < start { glucoseCursor += 1 }
+            var values: [Double] = []
+            var index = glucoseCursor
+            while index < glucose.count, glucose[index].date < end {
+                values.append(glucose[index].mgdl)
+                index += 1
+            }
+            guard values.count >= 8, let low = values.min(), let high = values.max(),
+                  range.contains(low), range.contains(high),
+                  abs(values[values.count - 1] - values[0]) <= maximumDrift
+            else { continue }
+            let mealNearby = dataset.meals.contains { meal in
+                guard meal.carbs >= 1 || meal.fat + meal.protein > 0 else { return false }
+                let window: TimeInterval = meal.fat + meal.protein > 20 ? 8 * 3600 : 4 * 3600
+                return meal.date < end && meal.date > start.addingTimeInterval(-window)
+            }
+            guard !mealNearby else { continue }
+            guard !boluses.contains(where: { $0.date < end && $0.date > start.addingTimeInterval(-3 * 3600) }) else { continue }
+            let hour = calendar.component(.hour, from: start)
+            let scheduled = scheduledBasal[hour]
+            while spanCursor < spans.count, spans[spanCursor].end <= start { spanCursor += 1 }
+            var covered: TimeInterval = 0
+            var delivered = 0.0
+            var spanIndex = spanCursor
+            while spanIndex < spans.count, spans[spanIndex].start < end {
+                let span = spans[spanIndex]
+                let overlap = min(span.end, end).timeIntervalSince(max(span.start, start))
+                if overlap > 0 {
+                    covered += overlap
+                    delivered += span.rate * overlap / 3600
+                }
+                spanIndex += 1
+            }
+            delivered += scheduled * max(0, 3600 - covered) / 3600
+            delivered += smbByHour[start] ?? 0
+            byHour[hour].append((calendar.startOfDay(for: start), min(3, delivered / scheduled)))
+        }
+        for hour in 0 ..< 24 {
+            let rows = byHour[hour].sorted { $0.day < $1.day }
+            guard Set(rows.map(\.day)).count >= minimumDays,
+                  let median = RheosStats.median(rows.map(\.ratio))
+            else { continue }
+            let half = rows.count / 2
+            guard let older = RheosStats.median(rows.prefix(half).map(\.ratio)),
+                  let newer = RheosStats.median(rows.suffix(rows.count - half).map(\.ratio)),
+                  abs(older - newer) <= maximumDisagreement
+            else { continue }
+            let count = Double(rows.count)
+            result[hour] = (count * median + 3) / (count + 3)
+        }
+        return result
+    }
+}
