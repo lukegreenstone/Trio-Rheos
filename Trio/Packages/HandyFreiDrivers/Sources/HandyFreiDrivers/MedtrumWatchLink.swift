@@ -139,7 +139,9 @@ public final class HandyFreiMedtrumLink: NSObject, CBCentralManagerDelegate, CBP
             throw HandyFreiLinkError.pumpRefused("Tempbasal nicht gesendet. \(block)")
         }
         let cancelFirst = state.temp || !state.known
-        if rate <= 0 || minutes <= 0 {
+        // Same as MedtrumPumpManager.enactTempBasal: only a zero duration cancels.
+        // A rate of 0 with a duration is sent as a zero temp, which stops basal insulin.
+        if minutes <= 0 {
             guard cancelFirst else { return }
             try await send(.cancelTempBasal)
             storeLiveBasal(known: true, isTemp: false, rate: 0, started: Date())
@@ -153,10 +155,10 @@ public final class HandyFreiMedtrumLink: NSObject, CBCentralManagerDelegate, CBP
             }
             storeLiveBasal(known: true, isTemp: false, rate: 0, started: Date())
         }
-        if rate <= 0 || minutes <= 0 { return }
+        let tempRate = max(0, rate)
         do {
-            try await send(.setTempBasal(rate: rate, minutes: minutes))
-            storeLiveBasal(known: true, isTemp: true, rate: rate, started: Date())
+            try await send(.setTempBasal(rate: tempRate, minutes: minutes))
+            storeLiveBasal(known: true, isTemp: true, rate: tempRate, started: Date())
         } catch {
             let prefix = cancelFirst ? "cancelTempBasal ausgeführt. " : ""
             throw HandyFreiLinkError.pumpRefused("\(prefix)setTempBasal gesendet. \(error.localizedDescription)")

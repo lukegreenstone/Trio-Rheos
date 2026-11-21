@@ -539,14 +539,26 @@ final class HandyFreiSession {
             let files = await MainActor.run { state.handyFreiFiles }
             guard HandyFreiLoop.enactsInsulin(files) else { continue }
             await mark(state, "Glukose älter als 12 Minuten. Kein Insulin.")
-            let busy = await MainActor.run { () -> Bool in
-                if self.dosing { return true }
+            // The loop decides: only a temp above the scheduled basal is ended. A zero or low
+            // temp keeps running out on the pump, as determine-basal does with stale glucose.
+            let mustCancel = await MainActor.run { () -> Bool in
+                if self.dosing || self.determining { return false }
+                guard self.tickNow(state).cancelTemp else { return false }
                 self.dosing = true
-                return false
+                return true
             }
-            guard !busy else { continue }
-            _ = await deliverTemp(state, rate: 0, minutes: 0)
-            await MainActor.run { self.dosing = false }
+            guard mustCancel else { continue }
+            let sent = await deliverTemp(state, rate: 0, minutes: 0)
+            await MainActor.run {
+                if sent {
+                    self.deliveries.append(HandyFreiLoop.Delivery(
+                        kind: "temp", units: 0, minutes: 0, date: Date(), label: "Temp-Abbruch"
+                    ))
+                    self.log.append(["date": Date().timeIntervalSince1970, "kind": "temp", "units": 0.0, "minutes": 0])
+                    HandyFreiDisk.save(session: self)
+                }
+                self.dosing = false
+            }
         }
     }
 
@@ -969,7 +981,10 @@ final class HandyFreiSession {
             "mgdl": mgdl
         ])
         HandyFreiDisk.save(session: self)
-        guard outcome.deliver || outcome.cancelTemp else { return }
+        // "No temp required" keeps the running temp and needs no pump traffic.
+        let setsTemp = outcome.setTemp && outcome.minutes > 0
+        let changesTemp = setsTemp || outcome.cancelTemp
+        guard changesTemp || (outcome.deliver && outcome.smb > 0) else { return }
         guard !dosing else { return }
         dosing = true
         doseStartedAt = Date()
@@ -990,23 +1005,30 @@ final class HandyFreiSession {
                 }
             }
             guard state.handyFreiRunning, epoch == self.doseEpoch else { return }
-            let deliverTemp = !outcome.cancelTemp && rate > 0 && outcome.minutes > 0
-            let sent = await self.deliverTemp(
-                state,
-                rate: deliverTemp ? rate : 0,
-                minutes: deliverTemp ? outcome.minutes : 0
-            )
-            if sent, deliverTemp {
-                await MainActor.run {
-                    self.deliveries.append(HandyFreiLoop.Delivery(kind: "temp", units: rate, minutes: outcome.minutes, date: Date()))
-                    self.log.append(["date": Date().timeIntervalSince1970, "kind": "temp", "units": rate, "minutes": outcome.minutes])
-                    HandyFreiDisk.save(session: self)
+            if changesTemp {
+                // A zero temp (rate 0, minutes > 0) is sent as a temp. Only a cancel uses minutes 0.
+                let tempRate = setsTemp ? rate : 0
+                let tempMinutes = setsTemp ? outcome.minutes : 0
+                let sent = await self.deliverTemp(state, rate: tempRate, minutes: tempMinutes)
+                if sent {
+                    await MainActor.run {
+                        // A cancel is stored as a 0-minute temp so IOB and TDD end the previous temp here.
+                        self.deliveries.append(HandyFreiLoop.Delivery(
+                            kind: "temp",
+                            units: tempRate,
+                            minutes: tempMinutes,
+                            date: Date(),
+                            label: setsTemp ? "" : "Temp-Abbruch"
+                        ))
+                        self.log.append(["date": Date().timeIntervalSince1970, "kind": "temp", "units": tempRate, "minutes": tempMinutes])
+                        HandyFreiDisk.save(session: self)
+                    }
+                    finished = setsTemp
+                        ? "Pumpe \(Self.clockMinute()): Temp \(String(format: "%.2f", tempRate)) U/h \(tempMinutes) min ok"
+                        : "Pumpe \(Self.clockMinute()): Temp abgebrochen ok"
+                } else {
+                    finished = await MainActor.run { state.handyFreiLoopLine }
                 }
-                finished = "Pumpe \(Self.clockMinute()): Temp \(String(format: "%.2f", rate)) U/h ok"
-            } else if sent {
-                finished = "Pumpe \(Self.clockMinute()): Temp abgebrochen ok"
-            } else {
-                finished = await MainActor.run { state.handyFreiLoopLine }
             }
             let underStep = outcome.smb > 0 && units <= 0
             let overCap = units > 0 && outcome.iob + units > outcome.maxIOB
@@ -1099,8 +1121,14 @@ final class HandyFreiSession {
             }
             return
         }
-        await MainActor.run { self.dosing = true }
         let amount = Self.medtrumStep(units)
+        guard amount > 0 else {
+            await MainActor.run {
+                state.handleAcknowledgment(success: false, message: "Unter 0,05 U. Kein Bolus.")
+            }
+            return
+        }
+        await MainActor.run { self.dosing = true }
         let sent = await deliverBolus(state, units: amount)
         await MainActor.run {
             self.dosing = false
@@ -1186,8 +1214,11 @@ final class HandyFreiSession {
         return String(format: "%02d:%02d", parts.hour ?? 0, parts.minute ?? 0)
     }
 
+    /// Rounds down to the patch's 0.05 U step, so a temp or SMB is never above what the loop asked for.
+    /// The small epsilon keeps 0.15 at 0.15 when the division lands a hair below 3.
     private static func medtrumStep(_ value: Double) -> Double {
-        (value / 0.05).rounded() * 0.05
+        guard value > 0 else { return 0 }
+        return ((value / 0.05) + 1e-6).rounded(.down) * 0.05
     }
 
     /// The command may already be on the pump. The iPhone reads the pump history after it reconnects.

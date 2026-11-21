@@ -5,7 +5,12 @@ import Foundation
 public enum HandyFreiLoop {
     public struct Outcome: Equatable {
         public var deliver: Bool
+        /// Ends the running temp so the pump goes back to its scheduled basal.
+        /// Only a determination with duration 0, or a high temp while glucose is stale.
         public var cancelTemp: Bool
+        /// Sends `rate` for `minutes`. A rate of 0 is a zero temp (insulin off), not a cancel.
+        /// False when determine-basal kept the running temp ("no temp required").
+        public var setTemp: Bool
         public var rate: Double
         public var minutes: Int
         public var smb: Double
@@ -97,7 +102,7 @@ public enum HandyFreiLoop {
         liveBasalStarted: Date = .distantPast
     ) -> Outcome {
         let empty = Outcome(
-            deliver: false, cancelTemp: false, rate: 0, minutes: 0, smb: 0,
+            deliver: false, cancelTemp: false, setTemp: false, rate: 0, minutes: 0, smb: 0,
             reason: "Schatten. Eingaben fehlen.", iob: 0, maxIOB: 0, maxBolus: 0, maxBasal: 0, cob: 0, failed: false
         )
         let points = combinedGlucose(files: files, watch: glucose, directions: directions)
@@ -198,9 +203,22 @@ public enum HandyFreiLoop {
                 glucoseHistory: mealPoints
             )
             let currentCOB = NSDecimalNumber(decimal: meal?.mealCOB ?? 0).doubleValue
+            let current = currentTemp(
+                history: history,
+                deliveries: deliveries,
+                now: now,
+                liveBasalKnown: liveBasalKnown,
+                liveBasalIsTemp: liveBasalIsTemp,
+                liveBasalRate: liveBasalRate,
+                liveBasalStarted: liveBasalStarted
+            )
             if glucoseIsStale {
                 var stale = empty
-                stale.cancelTemp = mode != "open"
+                // Same rule as determine-basal when glucose is too old: a temp above the
+                // scheduled rate is ended, a low or zero temp is left to run out on the pump.
+                let scheduled = profile.currentBasal ?? 0
+                let highTemp = current.duration > 0 && current.rate > scheduled
+                stale.cancelTemp = mode != "open" && highTemp
                 stale.iob = currentIOB
                 stale.cob = currentCOB
                 stale.maxIOB = NSDecimalNumber(decimal: preferences.maxIOB).doubleValue
@@ -220,15 +238,6 @@ public enum HandyFreiLoop {
                 basal: basal,
                 now: now,
                 preserveTDD: !(files["tddSeries"] ?? "").isEmpty
-            )
-            let current = currentTemp(
-                history: history,
-                deliveries: deliveries,
-                now: now,
-                liveBasalKnown: liveBasalKnown,
-                liveBasalIsTemp: liveBasalIsTemp,
-                liveBasalRate: liveBasalRate,
-                liveBasalStarted: liveBasalStarted
             )
             let determination = try DeterminationGenerator.generate(
                 profile: profile,
@@ -251,11 +260,17 @@ public enum HandyFreiLoop {
             let smb = max(0, NSDecimalNumber(decimal: determination?.units ?? 0).doubleValue)
             let maxBolus = NSDecimalNumber(decimal: settings.maxBolus).doubleValue
             let maxIOB = NSDecimalNumber(decimal: preferences.maxIOB).doubleValue
-            let cancel = (determination?.rate ?? 0) == 0
+            // Same contract as APSManager.enactDetermination and MedtrumPumpManager.enactTempBasal:
+            // a rate and a duration together are a temp command. Duration 0 cancels the running
+            // temp. Rate 0 with a duration is a zero temp. No rate means keep the running temp.
+            let hasTempCommand = determination?.rate != nil && determination?.duration != nil
+            let cancel = hasTempCommand && minutes == 0
+            let setTemp = hasTempCommand && minutes > 0
             let enact = mode != "open"
             return Outcome(
                 deliver: enact,
                 cancelTemp: enact && cancel,
+                setTemp: enact && setTemp,
                 rate: max(0, rate),
                 minutes: max(0, minutes),
                 smb: max(0, smb),
@@ -1003,34 +1018,24 @@ public enum HandyFreiLoop {
             )
             return TempBasal(duration: max(1, left), rate: Decimal(liveBasalRate), temp: .absolute, timestamp: now)
         }
-        let fromDelivery: (date: Date, temp: TempBasal)? = deliveries.last(where: {
-            $0.kind == "temp" && now.timeIntervalSince($0.date) < Double(max($0.minutes, 0)) * 60
-        }).map { dose in
-            let elapsed = Int(now.timeIntervalSince(dose.date) / 60)
-            return (dose.date, TempBasal(duration: max(0, dose.minutes - elapsed), rate: Decimal(dose.units), temp: .absolute, timestamp: now))
-        }
-        let fromHistory = history
+        // The newest temp command wins, whether the watch sent it or the copied history has it.
+        // A watch cancel is stored as a 0-minute temp, so it ends an older temp here too.
+        let lastDose = deliveries.filter { $0.kind == "temp" }.max(by: { $0.date < $1.date })
+        let newestCopied = history
             .filter { $0.type == .tempBasal && $0.isScheduledBasal != true }
             .max(by: { $0.timestamp < $1.timestamp })
-            .flatMap { event -> (date: Date, temp: TempBasal)? in
-                let duration = history.first {
-                    $0.type == .tempBasalDuration && abs($0.timestamp.timeIntervalSince(event.timestamp)) < 2
-                }?.durationMin ?? event.durationMin ?? event.duration ?? 0
-                let elapsed = Int(now.timeIntervalSince(event.timestamp) / 60)
-                let left = duration - elapsed
-                guard left > 0 else { return nil }
-                return (event.timestamp, TempBasal(duration: left, rate: event.rate ?? 0, temp: .absolute, timestamp: now))
-            }
-        switch (fromDelivery, fromHistory) {
-        case let (delivery?, copied?):
-            return delivery.date >= copied.date ? delivery.temp : copied.temp
-        case let (delivery?, nil):
-            return delivery.temp
-        case let (nil, copied?):
-            return copied.temp
-        default:
-            return idle
+        if let dose = lastDose, newestCopied.map({ dose.date >= $0.timestamp }) ?? true {
+            let left = dose.minutes - Int(now.timeIntervalSince(dose.date) / 60)
+            guard left > 0 else { return idle }
+            return TempBasal(duration: left, rate: Decimal(dose.units), temp: .absolute, timestamp: now)
         }
+        guard let event = newestCopied else { return idle }
+        let duration = history.first {
+            $0.type == .tempBasalDuration && abs($0.timestamp.timeIntervalSince(event.timestamp)) < 2
+        }?.durationMin ?? event.durationMin ?? event.duration ?? 0
+        let left = duration - Int(now.timeIntervalSince(event.timestamp) / 60)
+        guard left > 0 else { return idle }
+        return TempBasal(duration: left, rate: event.rate ?? 0, temp: .absolute, timestamp: now)
     }
 
     private static func remainingMinutes(
@@ -1153,8 +1158,9 @@ public enum HandyFreiLoop {
                 $0.type == .tempBasalDuration && abs($0.timestamp.timeIntervalSince(event.timestamp)) < 2
             }?.durationMin ?? event.duration ?? 0
             let rate = event.rate ?? event.amount ?? 0
-            guard minutes > 0 else { continue }
-            temps.append((event.timestamp, event.timestamp.addingTimeInterval(TimeInterval(minutes * 60)), rate))
+            // A 0-minute temp is a cancel. It delivers nothing, but it ends the temp before it.
+            let end = event.timestamp.addingTimeInterval(TimeInterval(max(0, minutes) * 60))
+            temps.append((event.timestamp, end, minutes > 0 ? rate : 0))
         }
         temps.sort { $0.start < $1.start }
         var tempInsulin = Decimal(0)
@@ -1212,13 +1218,14 @@ public enum HandyFreiLoop {
             suspended = firstKind == .pumpResume
         }
         var events: [(date: Date, end: Date, kind: String)] = []
+        var temps: [(date: Date, end: Date)] = []
         for event in history {
             switch event.type {
             case .tempBasal where event.isScheduledBasal != true:
                 let minutes = history.first {
                     $0.type == .tempBasalDuration && abs($0.timestamp.timeIntervalSince(event.timestamp)) < 2
                 }?.durationMin ?? event.duration ?? 0
-                events.append((event.timestamp, event.timestamp.addingTimeInterval(TimeInterval(minutes * 60)), "temp"))
+                temps.append((event.timestamp, event.timestamp.addingTimeInterval(TimeInterval(max(0, minutes) * 60))))
             case .pumpSuspend:
                 events.append((event.timestamp, event.timestamp, "suspend"))
             case .pumpResume:
@@ -1226,6 +1233,12 @@ public enum HandyFreiLoop {
             default:
                 break
             }
+        }
+        // A newer temp, or a cancel, ends the one before it. Scheduled basal resumes from there.
+        temps.sort { $0.date < $1.date }
+        for (index, temp) in temps.enumerated() {
+            let end = index + 1 < temps.count ? min(temp.end, temps[index + 1].date) : temp.end
+            events.append((temp.date, end, "temp"))
         }
         events.append((now, now, "now"))
         events.sort { $0.date < $1.date }
