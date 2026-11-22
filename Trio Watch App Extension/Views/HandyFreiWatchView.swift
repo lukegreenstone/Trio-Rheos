@@ -206,8 +206,10 @@ extension WatchState {
                 self.startHandyFrei()
             }
         })
-        // The phone is asked for a fresh copy, but the watch does not wait on it.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+        // The copy comes as a file of several hundred KB. Over Bluetooth that can take a while,
+        // so the watch waits up to 45 seconds before it starts from the copy it already has.
+        handyFreiStatus = "Handy-frei wird aktiviert. Warte auf die Kopie vom iPhone (bis 45 s)…"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 45) {
             // The iPhone said why it cannot hand over. That reason stays on screen.
             guard !self.handyFreiRunning, !self.handyFreiActivationRefused else { return }
             self.handyFreiStatus = "Kein neuer Schnappschuss. Start mit der letzten Kopie."

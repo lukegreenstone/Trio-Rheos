@@ -309,6 +309,12 @@ enum HandyFreiPhone {
             lastStandbyPush = .distantPast
             return
         }
+        if sendCopyFile(
+            payload: ["kind": "standby", "note": "", "ownsRadio": false],
+            snapshot: snapshot.plist,
+            kind: "standby",
+            link: link
+        ) { return }
         let payload: [String: Any] = ["kind": "standby", "note": "", "ownsRadio": false, "snapshot": snapshot.plist]
         let message: [String: Any] = ["handyFrei": payload]
         link.sendMessage(message, replyHandler: nil) { _ in
@@ -977,6 +983,7 @@ enum HandyFreiPhone {
         ]
         if let snapshot {
             payload["shadow"] = HandyFrei.shadowLine(glucose: snapshot.glucose, iob: snapshot.iob)
+            if sendCopyFile(payload: payload, snapshot: snapshot.plist, kind: kind, link: link) { return }
             payload["snapshot"] = snapshot.plist
         }
         let message = ["handyFrei": payload]
@@ -987,6 +994,43 @@ enum HandyFreiPhone {
         } else {
             link.transferUserInfo(message)
         }
+    }
+
+    /// The copy holds 24 h of pump history, glucose and carbs plus 10 days of TDD points, several
+    /// hundred KB. A WatchConnectivity message or user-info transfer is meant for about 64 KB and
+    /// fails above that (payloadTooLarge), so the copy goes as a file. An older copy of the same
+    /// kind still waiting in the queue is replaced. Returns false if the file could not be written.
+    static func sendCopyFile(payload: [String: Any], snapshot: [String: Any], kind: String, link: WCSession) -> Bool {
+        var full = payload
+        full["snapshot"] = snapshot
+        guard let data = try? PropertyListSerialization.data(
+            fromPropertyList: ["handyFrei": full],
+            format: .binary,
+            options: 0
+        ) else { return false }
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("HandyFreiCopies", isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        // Copies older than a day have been delivered or replaced.
+        let dayAgo = Date().addingTimeInterval(-24 * 3600)
+        let old = (try? FileManager.default.contentsOfDirectory(
+            at: folder,
+            includingPropertiesForKeys: [.contentModificationDateKey]
+        )) ?? []
+        for url in old {
+            let changed = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            if changed < dayAgo { try? FileManager.default.removeItem(at: url) }
+        }
+        let url = folder.appendingPathComponent("copy-\(kind)-\(UUID().uuidString).plist")
+        do {
+            try data.write(to: url, options: .atomic)
+        } catch {
+            return false
+        }
+        for transfer in link.outstandingFileTransfers where (transfer.file.metadata?["handyFreiCopy"] as? String) == kind {
+            transfer.cancel()
+        }
+        link.transferFile(url, metadata: ["handyFreiCopy": kind])
+        return true
     }
 }
 

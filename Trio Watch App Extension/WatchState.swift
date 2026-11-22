@@ -347,6 +347,17 @@ struct WatchHistoryLine: Identifiable, Equatable {
         handleIncomingWatchStatePayload(userInfo)
     }
 
+    /// The iPhone sends its copy as a file: it is far larger than a message may be.
+    /// The file is deleted when this returns, so it is read here.
+    func session(_: WCSession, didReceive file: WCSessionFile) {
+        guard file.metadata?["handyFreiCopy"] != nil,
+              let data = try? Data(contentsOf: file.fileURL),
+              let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+              object["handyFrei"] != nil
+        else { return }
+        absorbHandyFrei(object)
+    }
+
     /// The incoming key when it has a value, otherwise the one already stored.
     private static func keep(_ current: String, _ incoming: Any?) -> String {
         guard let value = incoming as? String, !value.isEmpty else { return current }
