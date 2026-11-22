@@ -72,6 +72,8 @@ struct WatchHistoryLine: Identifiable, Equatable {
     var handyFreiTraining = ""
     /// Another app's workout ended Handy-frei's session. The user restarts it after that training.
     var handyFreiYielded = false
+    /// The iPhone refused the hand-off and said why. The watch then does not start from its old copy.
+    var handyFreiActivationRefused = false
     /// Last loop time, determination, and pump result. Sensor packets do not overwrite this.
     var handyFreiLoopLine = ""
     var handyFreiFiles: [String: String] = [:]
@@ -397,6 +399,11 @@ struct WatchHistoryLine: Identifiable, Equatable {
                 self.sweetMealFactor = meal.sweetFactor
                 self.bolusFraction = meal.fraction
                 HandyFreiSession.HandyFreiDisk.saveSnapshot(self)
+            }
+            if kind == "refused" {
+                self.handyFreiActivationRefused = true
+                self.handyFreiAlarm = "iPhone: \(note)"
+                self.handyFreiStatus = "Handy-frei nicht gestartet. Grund steht unten."
             }
             if kind == "watch-owns" {
                 HandyFreiSession.shared.freshCopyArrived(self)

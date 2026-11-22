@@ -194,6 +194,7 @@ extension WatchState {
     func activateHandyFrei() {
         guard !handyFreiRunning else { return }
         handyFreiStatus = "Handy-frei wird aktiviert…"
+        handyFreiActivationRefused = false
         guard let session, session.activationState == .activated, session.isReachable else {
             startHandyFrei()
             return
@@ -207,7 +208,8 @@ extension WatchState {
         })
         // The phone is asked for a fresh copy, but the watch does not wait on it.
         DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
-            guard !self.handyFreiRunning else { return }
+            // The iPhone said why it cannot hand over. That reason stays on screen.
+            guard !self.handyFreiRunning, !self.handyFreiActivationRefused else { return }
             self.handyFreiStatus = "Kein neuer Schnappschuss. Start mit der letzten Kopie."
             self.startHandyFrei()
         }

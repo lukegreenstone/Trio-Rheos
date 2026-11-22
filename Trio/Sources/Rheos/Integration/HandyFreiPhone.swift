@@ -42,6 +42,8 @@ enum HandyFreiPhone {
             lock.unlock()
             HandyFreiGate.setPhoneLoopPaused(false)
             store(session)
+            // The watch is told why, instead of waiting and starting from an old copy without keys.
+            send(session, snapshot: nil, kind: "refused")
             return session
         }
         let session = HandyFrei.prepare(enabled: HandyFrei.isEnabled(), fingerprint: fingerprint)
@@ -544,7 +546,31 @@ enum HandyFreiPhone {
                 snapshot.refusal = "Phase-5-Schlüssel fehlt. Handy-frei startet nicht. Die Kopplung bleibt auf dem iPhone."
             }
         }
+        if snapshot.refusal == nil {
+            snapshot.refusal = missingOnPhone(pump: pump, cgm: cgm, snapshot: snapshot)
+        }
         return snapshot
+    }
+
+    /// What the iPhone itself lacks for a usable copy, in words the user can act on.
+    private static func missingOnPhone(pump: Any?, cgm: Any?, snapshot: HandyFrei.Snapshot) -> String? {
+        func name(_ value: Any?) -> String {
+            guard let value else { return "keins" }
+            return String(describing: type(of: value))
+        }
+        guard pump is MedtrumPumpManager else {
+            return "Im iPhone-Trio ist keine Medtrum-Pumpe verbunden (\(name(pump))). Handy-frei braucht die Medtrum-Kopplung aus Trio."
+        }
+        guard cgm is LibreLoopCGMManager else {
+            return "Im iPhone-Trio ist kein Libre über LibreLoop aktiv (\(name(cgm))). Handy-frei braucht den Libre 3 über LibreLoop."
+        }
+        if (snapshot.pumpSerial ?? "").isEmpty || (snapshot.sessionToken ?? "").isEmpty {
+            return "Die Medtrum-Sitzung fehlt auf dem iPhone. Trio einmal mit der Pumpe verbinden lassen, dann erneut."
+        }
+        if (snapshot.bleAddress ?? "").isEmpty || (snapshot.blePIN ?? "").isEmpty {
+            return "Adresse oder PIN des Libre fehlt auf dem iPhone. Trio einmal mit dem Sensor verbinden lassen, dann erneut."
+        }
+        return nil
     }
 
     static func mealPresets() -> [HandyFrei.MealPreset] {
