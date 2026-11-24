@@ -970,9 +970,13 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
             HandyFreiPhone.finishImport(cgm: cgm)
             return
         }
-        pump.ensureCurrentPumpData { _ in
-            Task { @MainActor in
-                HandyFreiPhone.finishImport(cgm: cgm)
+        // The watch closed the patch link just before it sent this log. A few seconds let the
+        // patch advertise again, so the first connect from the iPhone does not time out.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            pump.ensureCurrentPumpData { _ in
+                Task { @MainActor in
+                    HandyFreiPhone.finishImport(cgm: cgm)
+                }
             }
         }
     }

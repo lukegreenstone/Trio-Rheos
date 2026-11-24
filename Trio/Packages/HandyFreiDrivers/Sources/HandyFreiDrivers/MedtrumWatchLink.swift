@@ -41,6 +41,9 @@ public final class HandyFreiMedtrumLink: NSObject, CBCentralManagerDelegate, CBP
         stopping = true
         if let peripheral, let central {
             central.cancelPeripheralConnection(peripheral)
+            // Keep the manager alive until the cancel has gone out, so the patch link really closes.
+            let closing = central
+            queue.asyncAfter(deadline: .now() + 5) { _ = closing }
         }
         central = nil
         peripheral = nil

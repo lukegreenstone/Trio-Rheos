@@ -272,7 +272,7 @@ struct WatchHistoryLine: Identifiable, Equatable {
 
     func session(_: WCSession, didReceiveMessage message: [String: Any]) {
         if (message["handyFreiSendLog"] as? Bool) == true || (message["handyFreiSendLog"] as? NSNumber)?.boolValue == true {
-            HandyFreiSession.shared.flushOutbox(final: true)
+            handBackToPhone()
             return
         }
         if let ack = message["handyFreiLogAck"] as? [String] {
@@ -328,7 +328,7 @@ struct WatchHistoryLine: Identifiable, Equatable {
 
     func session(_: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
         if (userInfo["handyFreiSendLog"] as? Bool) == true || (userInfo["handyFreiSendLog"] as? NSNumber)?.boolValue == true {
-            HandyFreiSession.shared.flushOutbox(final: true)
+            handBackToPhone()
             return
         }
         if let ack = userInfo["handyFreiLogAck"] as? [String] {
@@ -347,12 +347,30 @@ struct WatchHistoryLine: Identifiable, Equatable {
         handleIncomingWatchStatePayload(userInfo)
     }
 
+    /// The iPhone took sensor and loop back and asks for the log. A stretch that is still running
+    /// ends here, so the watch lets go of the patch before the iPhone connects to it.
+    private func handBackToPhone() {
+        DispatchQueue.main.async {
+            if self.handyFreiRunning {
+                self.stopHandyFrei()
+            } else {
+                HandyFreiSession.shared.flushOutbox(final: true)
+            }
+        }
+    }
+
     /// The iPhone sends its copy as a file: it is far larger than a message may be.
     /// The file is deleted when this returns, so it is read here.
     func session(_: WCSession, didReceive file: WCSessionFile) {
         guard file.metadata?["handyFreiCopy"] != nil,
-              let data = try? Data(contentsOf: file.fileURL),
-              let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+              let raw = try? Data(contentsOf: file.fileURL)
+        else { return }
+        var data = raw
+        if (file.metadata?["compression"] as? String) == "lzfse" {
+            guard let unpacked = try? (raw as NSData).decompressed(using: .lzfse) as Data else { return }
+            data = unpacked
+        }
+        guard let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
               object["handyFrei"] != nil
         else { return }
         absorbHandyFrei(object)

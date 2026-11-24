@@ -1480,15 +1480,39 @@ final class HandyFreiSession {
         state.handyFreiRunning = false
         state.handyFreiTraining = ""
         state.handyFreiYielded = false
-        HandyFreiWorkout.shared.stop()
-        HandyFreiLibreLink.stop()
-        Task {
-            try? await HandyFreiMedtrumLink.shared.send(.cancelTempBasal)
-            HandyFreiMedtrumLink.shared.stop()
-        }
-        state.handyFreiStatus = "Handy-frei beendet. „Handy-frei aktivieren“ startet wieder, auch ohne iPhone."
+        state.handyFreiStatus = "Handy-frei wird beendet. Pumpe und Sensor werden freigegeben…"
         state.reportHandyFreiHeartbeat()
+        Task { @MainActor in
+            await self.releaseRadios()
+            state.handyFreiStatus = "Handy-frei beendet. Pumpe und Sensor sind frei für das iPhone. „Handy-frei aktivieren“ startet wieder, auch ohne iPhone."
+        }
+    }
+
+    /// Set when the temp cancel at the end of a stretch has answered.
+    private var releaseAnswered = false
+
+    /// Hands pump and sensor back in an order the iPhone can rely on. The final log is what lets
+    /// the iPhone dose again, so it goes only after the watch has let go of the patch: sensor
+    /// closed, temp cancelled (at most 15 s), pump connection closed, a short pause for the patch
+    /// to advertise again, then the log. The workout ends last, so watchOS keeps the app running
+    /// until all of that is done. Ending the workout first let the app sleep with the patch still
+    /// connected, and the iPhone then timed out on it.
+    @MainActor private func releaseRadios() async {
+        HandyFreiLibreLink.stop()
+        releaseAnswered = false
+        Task { @MainActor in
+            try? await HandyFreiMedtrumLink.shared.send(.cancelTempBasal)
+            self.releaseAnswered = true
+        }
+        let deadline = Date().addingTimeInterval(15)
+        while !releaseAnswered, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        if !releaseAnswered { HandyFreiMedtrumLink.shared.cancelPendingWrite() }
+        HandyFreiMedtrumLink.shared.stop()
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
         flushOutbox(final: true)
+        HandyFreiWorkout.shared.stop()
     }
 
     private func phoneReachable(_ state: WatchState) -> Bool {
@@ -1623,12 +1647,8 @@ final class HandyFreiSession {
         active = false
         HandyFreiDisk.save(session: self)
         state.reportHandyFreiHeartbeat()
-        flushOutbox(final: true)
-        HandyFreiWorkout.shared.stop()
-        HandyFreiLibreLink.stop()
-        Task {
-            try? await HandyFreiMedtrumLink.shared.send(.cancelTempBasal)
-            HandyFreiMedtrumLink.shared.stop()
+        Task { @MainActor in
+            await self.releaseRadios()
         }
     }
 

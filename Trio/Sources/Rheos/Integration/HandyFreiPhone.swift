@@ -280,11 +280,14 @@ enum HandyFreiPhone {
     }
 
     /// Keeps the watch copy current while the iPhone loops, so a later start without the iPhone
-    /// begins from recent pump history and does not need the four-hour hold. Sent every 10 minutes,
+    /// begins from recent pump history and does not need the four-hour hold. Sent every 30 minutes,
     /// only to a reachable watch, and never while Handy-frei runs. The watch ignores it while running.
     static func pushStandbySnapshot(pump: Any?, cgm: Any?, storage: FileStorage?) {
         guard HandyFrei.isEnabled(), !radioIsHandedOff, !HandyFreiGate.phoneLoopPaused, !awaitingImport else { return }
-        guard Date().timeIntervalSince(lastStandbyPush) >= 10 * 60, WCSession.isSupported() else { return }
+        // Without a Medtrum pump and a LibreLoop sensor there are no keys to copy. Checked first,
+        // so the heavy copy below is not built every minute for nothing.
+        guard pump is MedtrumPumpManager, cgm is LibreLoopCGMManager else { return }
+        guard Date().timeIntervalSince(lastStandbyPush) >= 30 * 60, WCSession.isSupported() else { return }
         let link = WCSession.default
         guard link.activationState == .activated, link.isReachable, link.isWatchAppInstalled else { return }
         lastStandbyPush = Date()
@@ -306,7 +309,8 @@ enum HandyFreiPhone {
         // Right after a launch the pump or the Libre manager may not be loaded yet. Such a copy
         // has no keys and is not sent; the next timer tick tries again.
         guard snapshot.refusal == nil, hasAllKeys(snapshot) else {
-            lastStandbyPush = .distantPast
+            // Try again in 5 minutes, not at the next one-minute tick.
+            lastStandbyPush = Date().addingTimeInterval(-25 * 60)
             return
         }
         if sendCopyFile(
@@ -1003,11 +1007,15 @@ enum HandyFreiPhone {
     static func sendCopyFile(payload: [String: Any], snapshot: [String: Any], kind: String, link: WCSession) -> Bool {
         var full = payload
         full["snapshot"] = snapshot
-        guard let data = try? PropertyListSerialization.data(
+        guard let plist = try? PropertyListSerialization.data(
             fromPropertyList: ["handyFrei": full],
             format: .binary,
             options: 0
         ) else { return false }
+        // The copy is mostly JSON text and shrinks several times with LZFSE, so the transfer is
+        // faster and costs both batteries less.
+        let compressed = try? (plist as NSData).compressed(using: .lzfse) as Data
+        let data = compressed ?? plist
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("HandyFreiCopies", isDirectory: true)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         // Copies older than a day have been delivered or replaced.
@@ -1029,7 +1037,9 @@ enum HandyFreiPhone {
         for transfer in link.outstandingFileTransfers where (transfer.file.metadata?["handyFreiCopy"] as? String) == kind {
             transfer.cancel()
         }
-        link.transferFile(url, metadata: ["handyFreiCopy": kind])
+        var metadata: [String: Any] = ["handyFreiCopy": kind]
+        if compressed != nil { metadata["compression"] = "lzfse" }
+        link.transferFile(url, metadata: metadata)
         return true
     }
 }
