@@ -163,6 +163,14 @@ Existing files touched only to show the screen, start the logger, or call the on
 
 Not changed: dosing engine, SMB settings, autosens generator, device managers, entitlements, Fastlane, GitHub workflows. HealthKit was already entitled. No new capability is required. The first time Schatten or Scharf is enabled, iOS asks for read access to the wearable types. If the sheet does not list them, enable them in Settings → Health → Data Access → Trio.
 
+## Recency, chat tools and load
+
+Learned averages weight recent days more: a day 14 days older counts half as much (`RheosReference.recencyHalfLifeDays`). That applies to the hourly basal and ISF residuals, the carb-ratio medians and the delivered-basal medians, so Rheos follows a change in the person over weeks while the band, the daily step and the walk-forward check stay as they are.
+
+With the Cloud-Auswertung switch and a key, the chat can call read-only tools (`RheosChatTools`): glucose by clock hour, one day's summary, meal outcomes with bolus and SMB, the learned and applied factors, the delivered-basal ratios, and workouts and sleep. Each tool reads the Rheos dataset on the iPhone and returns a short table. No tool doses, writes a setting or reaches a device. An endpoint without tool support gets the plain request.
+
+A refresh runs at most every 25 minutes unless the mode changes or the settings button asks for it, trains the core model once, at utility priority, and skips the small network in Low Power Mode. The Rheos file is written two seconds after the last change in a row, without indentation, and once more when the app goes to the background. Nearest loop states are found by binary search.
+
 ## Handy-frei on the watch
 
 The watch runs the same Swift determine-basal as the iPhone (`HandyFreiLoop.tick`) and talks to the Medtrum patch and the Libre 3 itself.
@@ -173,6 +181,8 @@ The watch runs the same Swift determine-basal as the iPhone (`HandyFreiLoop.tick
 - A new start from a copy older than 30 minutes holds extra insulin for four hours: max IOB 0, the Low Glucose Suspend limits. Zero and low temps still run. The iPhone refreshes the copy every 10 minutes while the watch is reachable and Handy-frei is off, so this hold normally does not happen. The watch screen can lift it after the user confirms the iPhone gave nothing since the copy.
 - Below 10 % battery the loop keeps running with the same hold, so a zero temp before a low still goes out.
 - While Handy-frei runs, a bolus from the iPhone is refused (`APSManager.enactBolus`). The watch would not know about it.
+- Ending Handy-frei, or the iPhone taking the loop back, releases in a fixed order: sensor closed, temp cancelled (at most 15 s), patch connection closed, a 2-second pause, then the final log that lets the iPhone dose, and the workout last. The iPhone waits 3 more seconds before it reads the pump.
+- The hand-off copy goes as an LZFSE-compressed file (`transferFile`); a message is meant for about 64 KB and the copy is several hundred. A standby copy goes every 30 minutes and only with every key.
 - The watch alarms on its own: urgent low (never below a 55 mg/dL floor), low and high with the iPhone's thresholds from the copy, no glucose for 20 minutes, no loop for 20 minutes, a workout that could not restart, and low battery.
 - The watch also raises "Bald niedrig" when the lowest of the IOB, COB, UAM and ZT curves is at or below the iPhone's forecasted-low threshold in 20 minutes (the iPhone's rule), and "Kohlenhydrate nötig" when determine-basal asks for at least the iPhone's carbs-required grams.
 - After a crash or kill, watchOS relaunches the app and `handleActiveWorkoutRecovery` takes the running workout over. The keep-alive workout does not collect heart rate or energy and is never saved.

@@ -9,7 +9,7 @@ import Foundation
 /// previous bytes. A newer schema than this build understands is not rewritten
 /// down.
 final class RheosStore {
-    static let shared = RheosStore(directory: RheosStore.defaultDirectory())
+    static let shared = RheosStore(directory: RheosStore.defaultDirectory(), deferWrites: true)
 
     let directory: URL
     /// Nil when iCloud Documents is not in the provisioning profile. Local storage still works.
@@ -18,9 +18,14 @@ final class RheosStore {
     private let lock = NSLock()
     private var cached: RheosStateDocument?
     private var preserveNewerSchema = false
+    /// The app's store writes in the background: several saves in a row become one write.
+    private let deferWrites: Bool
+    private var writePending = false
+    private let writer = DispatchQueue(label: "rheos.store.writer", qos: .utility)
 
-    init(directory: URL) {
+    init(directory: URL, deferWrites: Bool = false) {
         self.directory = directory
+        self.deferWrites = deferWrites
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         #if os(iOS) || os(macOS)
         var values = URLResourceValues()
@@ -271,7 +276,38 @@ final class RheosStore {
         copy.schemaVersion = max(copy.schemaVersion, RheosSchema.current)
         copy.bounds = copy.bounds.sanitized()
         cached = copy
-        try? writeDocument(copy, overwriting: file(RheosSchema.stateFile))
+        guard deferWrites else {
+            try? writeDocument(copy, overwriting: file(RheosSchema.stateFile))
+            return
+        }
+        // The document holds 45 days of glucose, insulin and loop states, several MB. A refresh
+        // saves it four or five times, and the loop waited on this lock for each write. Every
+        // reader already gets the newest state from the cache; the file follows 2 seconds later.
+        guard !writePending else { return }
+        writePending = true
+        writer.asyncAfter(deadline: .now() + 2) { [weak self] in
+            self?.writePendingDocument()
+        }
+    }
+
+    private func writePendingDocument() {
+        lock.lock()
+        let latest = cached
+        writePending = false
+        lock.unlock()
+        guard let latest else { return }
+        try? writeDocument(latest, overwriting: file(RheosSchema.stateFile))
+    }
+
+    /// Writes a change that is still waiting, for example when the app goes to the background.
+    func flush() {
+        writer.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let pending = self.writePending
+            self.lock.unlock()
+            if pending { self.writePendingDocument() }
+        }
     }
 
     private func writeDocument(_ state: RheosStateDocument, overwriting url: URL) throws {
@@ -279,7 +315,7 @@ final class RheosStore {
         if preserveNewerSchema, let existing = try? Data(contentsOf: url), !existing.isEmpty {
             data = try RheosMigrator.merging(state, into: existing)
         } else {
-            data = try RheosCoding.encoder().encode(state)
+            data = try RheosCoding.storageEncoder().encode(state)
         }
         try RheosFileProtection.write(data, to: url)
         if let backup = backupDirectory() {
@@ -319,6 +355,14 @@ enum RheosCoding {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return encoder
+    }
+
+    /// The file on disk: no indentation and no key sorting. It is read by the decoder only;
+    /// the export keeps the readable `encoder()`.
+    static func storageEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
         return encoder
     }
 

@@ -42,6 +42,7 @@ enum RheosCoreModel {
         targets: RheosTargetSchedule,
         band: ClosedRange<Double>,
         acceptedSignals: [String] = [],
+        trainNetwork allowNetwork: Bool = true,
         calendar: Calendar
     ) -> RheosCoreFit {
         let rows = rows(dataset: dataset, targets: targets, accepted: acceptedSignals, calendar: calendar)
@@ -56,7 +57,8 @@ enum RheosCoreModel {
             return idle
         }
         let ridgeMAE = solve(train).flatMap { mae(test, weights: $0) }
-        let network = trainNetwork(train: train, test: test)
+        // Low Power Mode skips the network; ridge and the hourly median still compete.
+        let network = allowNetwork ? trainNetwork(train: train, test: test) : nil
         var chosen = "median"
         var best = baseline
         if let ridgeMAE, ridgeMAE + 0.5 < best {
@@ -116,14 +118,20 @@ enum RheosCoreModel {
         accepted: [String],
         calendar: Calendar
     ) -> [Row] {
+        // Sorted once and looked up by binary search; a day's wearable row by dictionary.
+        let states = dataset.states.sorted { $0.date < $1.date }
+        let stateDates = states.map(\.date)
+        var wearableByDay: [Date: RheosWearableDay] = [:]
+        for row in dataset.wearableDays {
+            let key = calendar.startOfDay(for: row.day)
+            if wearableByDay[key] == nil { wearableByDay[key] = row }
+        }
         return dataset.glucose.compactMap { point in
             guard point.mgdl.isFinite, point.mgdl > 0 else { return nil }
             let hour = calendar.component(.hour, from: point.date)
             let day = calendar.startOfDay(for: point.date)
-            let wearable = dataset.wearableDays.first { calendar.startOfDay(for: $0.day) == day }
-            let state = dataset.states.min {
-                abs($0.date.timeIntervalSince(point.date)) < abs($1.date.timeIntervalSince(point.date))
-            }
+            let wearable = wearableByDay[day]
+            let state = RheosStats.nearestIndex(sortedDates: stateDates, to: point.date).map { states[$0] }
             return Row(
                 day: day,
                 hour: hour,

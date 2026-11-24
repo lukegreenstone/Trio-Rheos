@@ -17,7 +17,7 @@ enum RheosChatEngine {
         let prompt = prompt(question: question, report: report, settingsNote: settingsNote)
         var cloudFailure = ""
         if RheosCloudPolicy.allowsCloud() {
-            let outcome = await RheosCloudChat.reply(prompt: prompt, resolver: resolver)
+            let outcome = await RheosCloudChat.replyWithTools(prompt: prompt, resolver: resolver)
             if case let .success(text, model) = outcome {
                 return packaged(text, source: RheosCloudChat.sourceName(model: model))
             }
@@ -39,6 +39,21 @@ enum RheosChatEngine {
         let local = RheosChatStub.reply(question: question, report: report, settingsNote: settingsNote)
         let text = cloudFailure.isEmpty ? local : cloudFailure + "\n\n" + local
         return packaged(text, source: "lokal")
+    }
+
+    /// Trio's scheduled basal per clock hour (U/h, mean of the hour), for the delivered-basal tool.
+    static func scheduledBasal(resolver: Resolver) -> [Double] {
+        let profile = resolver.resolve(FileStorage.self)?
+            .retrieve(OpenAPS.Settings.basalProfile, as: [BasalProfileEntry].self) ?? []
+        let sorted = profile.sorted { $0.minutes < $1.minutes }
+        guard let latest = sorted.last else { return [] }
+        func rate(atMinute minute: Int) -> Double {
+            let entry = sorted.last(where: { $0.minutes <= minute }) ?? latest
+            return NSDecimalNumber(decimal: entry.rate).doubleValue
+        }
+        return (0 ..< 24).map { hour in
+            [0, 15, 30, 45].map { rate(atMinute: hour * 60 + $0) }.reduce(0, +) / 4
+        }
     }
 
     static func packaged(_ text: String, source: String) -> RheosChatResult {
@@ -87,6 +102,12 @@ enum RheosFoundationChat {
 
 enum RheosCloudOutcome: Equatable {
     case success(text: String, model: String)
+    case failure(String)
+}
+
+/// The raw assistant message, so a tool call can be answered.
+enum RheosCloudMessage {
+    case message([String: Any], model: String)
     case failure(String)
 }
 
@@ -144,7 +165,65 @@ enum RheosCloudChat {
         return await perform(extra: body, resolver: resolver)
     }
 
+    /// Chat with read-only data tools (`RheosChatTools`). The model may call tools in up to four
+    /// rounds; every result is a short text table from the Rheos data on this iPhone. An endpoint
+    /// that rejects tools (HTTP 400 or 422) gets the plain request instead.
+    static func replyWithTools(prompt: String, resolver: Resolver) async -> RheosCloudOutcome {
+        let dataset = RheosStore.shared.loadDataset()
+        let decision = RheosStore.shared.loadDecision()
+        let basal = RheosChatEngine.scheduledBasal(resolver: resolver)
+        var messages: [[String: Any]] = [
+            ["role": "system", "content": RheosChatParser.instructions() + "\n" + RheosChatTools.guidance],
+            ["role": "user", "content": prompt]
+        ]
+        for _ in 0 ..< 4 {
+            let outcome = await performMessage(
+                extra: ["messages": messages, "tools": RheosChatTools.definitions, "tool_choice": "auto"],
+                resolver: resolver
+            )
+            switch outcome {
+            case let .failure(text):
+                if text.contains("HTTP 400") || text.contains("HTTP 422") {
+                    return await reply(prompt: prompt, resolver: resolver)
+                }
+                return .failure(text)
+            case let .message(message, model):
+                guard let calls = message["tool_calls"] as? [[String: Any]], !calls.isEmpty else {
+                    guard let content = RheosCloudContent.text(from: message["content"]) else {
+                        return .failure("\(sourceName(model: model)): leere Antwort.")
+                    }
+                    return .success(text: content, model: model)
+                }
+                messages.append(message)
+                for call in calls {
+                    let function = call["function"] as? [String: Any]
+                    let result = RheosChatTools.run(
+                        name: function?["name"] as? String ?? "",
+                        arguments: function?["arguments"] as? String ?? "{}",
+                        dataset: dataset,
+                        decision: decision,
+                        scheduledBasal: basal
+                    )
+                    messages.append(["role": "tool", "tool_call_id": call["id"] as? String ?? "", "content": result])
+                }
+            }
+        }
+        return await reply(prompt: prompt, resolver: resolver)
+    }
+
     static func perform(extra: [String: Any], resolver: Resolver) async -> RheosCloudOutcome {
+        switch await performMessage(extra: extra, resolver: resolver) {
+        case let .failure(text):
+            return .failure(text)
+        case let .message(message, model):
+            guard let content = RheosCloudContent.text(from: message["content"]) else {
+                return .failure("\(sourceName(model: model)): leere Antwort.")
+            }
+            return .success(text: content, model: model)
+        }
+    }
+
+    static func performMessage(extra: [String: Any], resolver: Resolver) async -> RheosCloudMessage {
         guard let keychain = resolver.resolve(Keychain.self) else {
             return .failure("Grok: der Schlüsselbund ist nicht erreichbar.")
         }
@@ -189,11 +268,10 @@ enum RheosCloudChat {
         }
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let choices = json["choices"] as? [[String: Any]],
-              let message = choices.first?["message"] as? [String: Any],
-              let content = RheosCloudContent.text(from: message["content"]) else {
+              let message = choices.first?["message"] as? [String: Any] else {
             return .failure("\(name): leere Antwort.")
         }
-        return .success(text: content, model: model)
+        return .message(message, model: model)
     }
 
     static func httpFailure(name: String, status: Int, data: Data) -> String {

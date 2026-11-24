@@ -42,6 +42,15 @@ enum RheosReference {
     static let expectedMealRiseMgdl = 40.0
     /// IOB (units) from which an hour counts as a correction. Its error then teaches ISF, not basal.
     static let correctionIOB = 1.0
+    /// A day this many days older counts half as much in the learned averages. Rheos keeps
+    /// adapting over weeks and months instead of averaging 45 days evenly.
+    static let recencyHalfLifeDays = 14.0
+
+    /// Weight of a value from `date` when `newest` is the latest day in the data.
+    static func recencyWeight(_ date: Date, newest: Date) -> Double {
+        let ageDays = max(0, newest.timeIntervalSince(date) / 86400)
+        return pow(0.5, ageDays / recencyHalfLifeDays)
+    }
     static let minimumMealsForCarbRatio = 8
     /// Default band, matching Trio's default autosens min/max (`Preferences`).
     static let defaultMinimumMultiplier = 0.7

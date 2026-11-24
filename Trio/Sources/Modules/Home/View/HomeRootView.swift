@@ -125,6 +125,13 @@ extension Home {
                     .accessibilityLabel(Text(basal.accessibilityLabel))
                 }
             }
+            .overlay(alignment: .topLeading) {
+                // Rheos takes no row of its own: the chart height above is computed from the
+                // fixed slots only, so an extra row pushed the home screen past one page.
+                RheosHomeChip { showRheosSheet = true }
+                    .frame(height: chartHeight * 0.10)
+                    .padding(.leading, 12)
+            }
         }
 
         /// Rate pill: what the pump delivers, and whether the temp is the user's own.
@@ -254,12 +261,6 @@ extension Home {
                 }
                 // fixed slot: header state changes never reflow the zones below
                 .frame(height: HomeLayout.headerHeight)
-
-                RheosModeBanner()
-                Button("Rheos") { showRheosSheet = true }
-                    .font(.footnote.weight(.semibold))
-                    .buttonStyle(.bordered)
-                    .padding(.bottom, 4)
 
                 mealPanel()
                     .frame(height: HomeLayout.mealSlotHeight)

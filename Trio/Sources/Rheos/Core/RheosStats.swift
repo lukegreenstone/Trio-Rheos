@@ -17,6 +17,39 @@ enum RheosStats {
         return finite.reduce(0, +) / Double(finite.count)
     }
 
+    /// Median where each value counts with its weight (recent days more than old ones).
+    static func weightedMedian(_ pairs: [(value: Double, weight: Double)]) -> Double? {
+        let usable = pairs.filter { $0.value.isFinite && $0.weight > 0 }.sorted { $0.value < $1.value }
+        let total = usable.reduce(0) { $0 + $1.weight }
+        guard total > 0 else { return nil }
+        var running = 0.0
+        for pair in usable {
+            running += pair.weight
+            if running >= total / 2 { return pair.value }
+        }
+        return usable.last?.value
+    }
+
+    /// Index of the date nearest to `date` in a list sorted ascending, by binary search.
+    /// On a tie the earlier one wins, as `min(by:)` over the sorted list would pick it.
+    static func nearestIndex(sortedDates dates: [Date], to date: Date) -> Int? {
+        guard !dates.isEmpty else { return nil }
+        var low = 0
+        var high = dates.count - 1
+        while low < high {
+            let middle = (low + high) / 2
+            if dates[middle] < date {
+                low = middle + 1
+            } else {
+                high = middle
+            }
+        }
+        if low > 0, abs(dates[low - 1].timeIntervalSince(date)) <= abs(dates[low].timeIntervalSince(date)) {
+            return low - 1
+        }
+        return low
+    }
+
     static func nearest(_ points: [RheosGlucosePoint], to date: Date, within seconds: TimeInterval) -> Double? {
         var best: RheosGlucosePoint?
         var bestDistance = seconds

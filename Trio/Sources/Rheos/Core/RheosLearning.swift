@@ -21,6 +21,7 @@ enum RheosLearner {
         sites: [RheosPatchSite] = [],
         lateDigestion: [RheosLateDigestion] = [],
         scheduledBasal: [Double] = [],
+        coreFit: RheosCoreFit? = nil,
         now: Date,
         calendar: Calendar = .current
     ) -> RheosProfileDecision {
@@ -55,6 +56,7 @@ enum RheosLearner {
             band: band,
             acceptedSignals: acceptedSignals,
             scheduledBasal: scheduledBasal,
+            coreFit: coreFit,
             calendar: calendar
         )
         let learned = RheosDynamicISF.neutralize(fitted, dynamicISFOn: dynamicISFOn)
@@ -210,6 +212,7 @@ enum RheosLearner {
         band: ClosedRange<Double>,
         acceptedSignals: [String] = [],
         scheduledBasal: [Double] = [],
+        coreFit: RheosCoreFit? = nil,
         calendar: Calendar
     ) -> RheosHourlyFactors {
         let observations = RheosFit.observations(dataset: dataset, targets: targets, calendar: calendar)
@@ -218,7 +221,9 @@ enum RheosLearner {
             band: band,
             priorStrength: RheosBodyPrior.strength(for: dataset.body)
         )
-        let core = RheosCoreModel.fit(
+        // A refresh trains the core model once and passes it in; training it here a second
+        // time was the heaviest part of every refresh.
+        let core = coreFit ?? RheosCoreModel.fit(
             dataset: dataset,
             targets: targets,
             band: band,

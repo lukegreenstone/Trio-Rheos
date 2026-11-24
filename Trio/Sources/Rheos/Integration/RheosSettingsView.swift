@@ -206,7 +206,7 @@ struct RheosSettingsView: View {
 
             Section {
                 Button("Health-Daten jetzt lesen") {
-                    Task { await coordinator?.refresh() }
+                    Task { await coordinator?.refresh(force: true) }
                 }
                 Button("Lernstand exportieren") {
                     export()

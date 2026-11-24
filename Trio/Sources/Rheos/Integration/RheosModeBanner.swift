@@ -43,3 +43,42 @@ struct RheosModeBanner: View {
         }
     }
 }
+
+/// Small Rheos capsule over the top-left of the home chart. One tap opens the Rheos sheet,
+/// where the mode, the chat and the meal help live. It takes no row of its own.
+struct RheosHomeChip: View {
+    let onOpen: () -> Void
+    @State private var mode = RheosModeStore.current
+
+    var body: some View {
+        Button(action: onOpen) {
+            HStack(spacing: 4) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(label)
+                    .font(.system(size: 13, weight: .semibold))
+                    .fontDesign(.rounded)
+            }
+            .foregroundStyle(mode == .scharf ? Color.purple : Color.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(Color.primary.opacity(0.08)))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text("Rheos öffnen, Modus \(label)"))
+        .onAppear { mode = RheosModeStore.current }
+        .onReceive(
+            Foundation.NotificationCenter.default.publisher(for: Foundation.Notification.Name.rheosModeDidChange)
+        ) { (_: Foundation.Notification) in
+            mode = RheosModeStore.current
+        }
+    }
+
+    private var label: String {
+        switch mode {
+        case .aus: return "Rheos"
+        case .schatten: return "Rheos · Schatten"
+        case .scharf: return "Rheos · Scharf"
+        }
+    }
+}

@@ -32,7 +32,7 @@ final class RheosCoordinator {
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
         timer.schedule(deadline: .now() + 20, repeating: 15 * 60)
         timer.setEventHandler { [weak self] in
-            Task { await self?.refresh() }
+            Task.detached(priority: .utility) { await self?.refresh() }
         }
         timer.resume()
         self.timer = timer
@@ -42,16 +42,23 @@ final class RheosCoordinator {
         let foregroundName: Foundation.Notification.Name = UIApplication.willEnterForegroundNotification
         let mainQueue: OperationQueue = OperationQueue.main
         observers.append(center.addObserver(forName: modeName, object: nil, queue: mainQueue) { [weak self] (_: Foundation.Notification) in
-            Task { await self?.refresh() }
+            Task.detached(priority: .utility) { await self?.refresh(force: true) }
         })
         observers.append(center.addObserver(
             forName: foregroundName,
             object: nil,
             queue: mainQueue
         ) { [weak self] (_: Foundation.Notification) in
-            Task { await self?.refresh() }
+            Task.detached(priority: .utility) { await self?.refresh() }
         })
-        Task { await refresh() }
+        observers.append(center.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: mainQueue
+        ) { (_: Foundation.Notification) in
+            RheosStore.shared.flush()
+        })
+        Task.detached(priority: .utility) { [weak self] in await self?.refresh(force: true) }
     }
 
     func setMode(_ mode: RheosMode) {
@@ -83,9 +90,13 @@ final class RheosCoordinator {
         return RheosRamp.preview(learned: decision.learnedFactors, step: step, shadow: state.shadow)
     }
 
-    func refresh() async {
+    /// Reads Trio's data and HealthKit and runs the learning. The learning is hourly in nature,
+    /// so a timer tick or an app switch within 25 minutes of the last run does nothing. Training
+    /// the model on 45 days at every app switch kept the CPU busy in the background, where iOS
+    /// ends an app that uses too much of it. A mode change or the settings button forces a run.
+    func refresh(force: Bool = false) async {
         guard RheosModeStore.current != .aus else { return }
-        guard beginRefresh() else { return }
+        guard beginRefresh(force: force) else { return }
         defer { endRefresh() }
 
         let store = RheosStore.shared
@@ -143,6 +154,15 @@ final class RheosCoordinator {
         }
 
         store.saveDataset(dataset, now: now)
+        let accepted = store.loadDocument().acceptedSignals
+        let fit = RheosCoreModel.fit(
+            dataset: RheosDataQuality.excludingUnusable(dataset, sites: store.patchSites(), calendar: .current, now: now),
+            targets: RheosTargetLoader.schedule(resolver: resolver),
+            band: store.loadBounds().effectiveRange(autosensMin: autosensMin(), autosensMax: autosensMax()),
+            acceptedSignals: accepted,
+            trainNetwork: !ProcessInfo.processInfo.isLowPowerModeEnabled,
+            calendar: .current
+        )
         let decision = RheosLearner.evaluate(
             dataset: dataset,
             mode: RheosModeStore.current,
@@ -158,17 +178,10 @@ final class RheosCoordinator {
             sites: store.patchSites(),
             lateDigestion: store.loadDocument().lateDigestion,
             scheduledBasal: scheduledBasalByHour(),
+            coreFit: fit,
             now: now
         )
         store.saveDecision(decision)
-        let accepted = store.loadDocument().acceptedSignals
-        let fit = RheosCoreModel.fit(
-            dataset: dataset,
-            targets: RheosTargetLoader.schedule(resolver: resolver),
-            band: store.loadBounds().effectiveRange(autosensMin: autosensMin(), autosensMax: autosensMax()),
-            acceptedSignals: accepted,
-            calendar: .current
-        )
         var recorded = store.loadDocument()
         recorded.shadow = RheosShadowStatus(
             trained: fit.trained,
@@ -676,11 +689,15 @@ final class RheosCoordinator {
         }
     }
 
-    private func beginRefresh() -> Bool {
+    private var lastRefresh = Date.distantPast
+
+    private func beginRefresh(force: Bool) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         if isRefreshing { return false }
+        if !force, Date().timeIntervalSince(lastRefresh) < 25 * 60 { return false }
         isRefreshing = true
+        lastRefresh = Date()
         return true
     }
 

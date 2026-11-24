@@ -67,10 +67,14 @@ enum RheosFit {
         targets: RheosTargetSchedule,
         calendar: Calendar
     ) -> [Observation] {
-        dataset.glucose.compactMap { point in
+        // Sorted once: the nearest loop state is then a binary search, not a scan of every state
+        // for every glucose value (45 days made that about 170 million comparisons per call).
+        let states = dataset.states.sorted { $0.date < $1.date }
+        let stateDates = states.map(\.date)
+        return dataset.glucose.compactMap { point in
             guard point.mgdl.isFinite, point.mgdl > 0 else { return nil }
             let hour = calendar.component(.hour, from: point.date)
-            let state = nearestState(at: point.date, states: dataset.states)
+            let state = nearestState(at: point.date, states: states, dates: stateDates)
             return Observation(
                 day: calendar.startOfDay(for: point.date),
                 hour: hour,
@@ -102,16 +106,20 @@ enum RheosFit {
     /// quiet hours, ISF from correction hours (`lesson`).
     static func fit(observations: [Observation], band: ClosedRange<Double>, priorStrength: Double = RheosBodyPrior.plain) -> Model {
         let slopes = slopes(observations)
-        var basalResiduals: [Int: [Double]] = [:]
-        var isfResiduals: [Int: [Double]] = [:]
+        // Recent days count more (half-life `RheosReference.recencyHalfLifeDays`), so the factors
+        // follow a change in the person over weeks. The shrinkage below still uses the plain count.
+        let newest = observations.map(\.day).max() ?? Date()
+        var basalResiduals: [Int: [(value: Double, weight: Double)]] = [:]
+        var isfResiduals: [Int: [(value: Double, weight: Double)]] = [:]
         for observation in observations {
             let explained = slopes.iob * observation.iob + slopes.carb * observation.activeCarbs
             let residual = (observation.glucose - observation.target) - explained
+            let weighted = (value: residual, weight: RheosReference.recencyWeight(observation.day, newest: newest))
             switch lesson(iob: observation.iob, activeCarbs: observation.activeCarbs) {
             case .basal:
-                basalResiduals[observation.hour, default: []].append(residual)
+                basalResiduals[observation.hour, default: []].append(weighted)
             case .isf:
-                isfResiduals[observation.hour, default: []].append(residual)
+                isfResiduals[observation.hour, default: []].append(weighted)
             case .neither:
                 break
             }
@@ -123,13 +131,13 @@ enum RheosFit {
         for hour in 0 ..< 24 {
             let target = observations.first { $0.hour == hour }?.target ?? RheosReference.missingTargetFallbackMgdl
             if let values = basalResiduals[hour], values.count >= RheosReference.minimumSamplesPerHour,
-               let mean = RheosStats.mean(values)
+               let mean = weightedMean(values)
             {
                 basal[hour] = 1 + RheosReference.deviationGain * mean / max(target, 1)
                 basalCounts[hour] = values.count
             }
             if let values = isfResiduals[hour], values.count >= RheosReference.minimumSamplesPerHour,
-               let mean = RheosStats.mean(values)
+               let mean = weightedMean(values)
             {
                 isf[hour] = 1 - RheosReference.deviationGain * mean / max(target, 1)
                 isfCounts[hour] = values.count
@@ -138,6 +146,12 @@ enum RheosFit {
         basal = smooth(shrink(basal, counts: basalCounts, priorStrength: priorStrength), band: band)
         isf = smooth(shrink(isf, counts: isfCounts, priorStrength: priorStrength), band: band)
         return Model(factors: RheosHourlyFactors(basal: basal, isf: isf, carbRatio: Array(repeating: 1, count: 24)), iobSlope: slopes.iob, carbSlope: slopes.carb)
+    }
+
+    private static func weightedMean(_ values: [(value: Double, weight: Double)]) -> Double? {
+        let total = values.reduce(0) { $0 + $1.weight }
+        guard total > 0 else { return nil }
+        return values.reduce(0) { $0 + $1.value * $1.weight } / total
     }
 
     static func predict(_ observation: Observation, model: Model) -> Double {
@@ -158,7 +172,8 @@ enum RheosFit {
         guard dataset.meals.count >= RheosReference.minimumMealsForCarbRatio else {
             return raw
         }
-        var byHour: [Int: [Double]] = [:]
+        var byHour: [Int: [(value: Double, weight: Double)]] = [:]
+        let newestMeal = dataset.meals.map(\.date).max() ?? Date()
         let usualShare = RheosStats.median(dataset.meals.compactMap { bolusShare(meal: $0, insulin: dataset.insulin) })
         for meal in dataset.meals {
             guard let before = RheosMealDelta.sample(dataset.glucose, at: meal.date),
@@ -174,10 +189,13 @@ enum RheosFit {
             if let usualShare, usualShare > 0, let share = bolusShare(meal: meal, insulin: dataset.insulin) {
                 fromSMB = min(1.2, max(0.8, (share / usualShare).squareRoot()))
             }
-            byHour[hour, default: []].append(fromGlucose * fromSMB)
+            byHour[hour, default: []].append((
+                value: fromGlucose * fromSMB,
+                weight: RheosReference.recencyWeight(meal.date, newest: newestMeal)
+            ))
         }
         for hour in 0 ..< 24 {
-            guard let values = byHour[hour], values.count >= 2, let median = RheosStats.median(values) else { continue }
+            guard let values = byHour[hour], values.count >= 2, let median = RheosStats.weightedMedian(values) else { continue }
             raw[hour] = median
             counts[hour] = values.count
         }
@@ -248,9 +266,10 @@ enum RheosFit {
         }
     }
 
-    private static func nearestState(at date: Date, states: [RheosStatePoint]) -> (iob: Double, cob: Double) {
-        guard let nearest = states.min(by: { abs($0.date.timeIntervalSince(date)) < abs($1.date.timeIntervalSince(date)) }),
-              abs(nearest.date.timeIntervalSince(date)) <= 20 * 60 else { return (0, 0) }
+    private static func nearestState(at date: Date, states: [RheosStatePoint], dates: [Date]) -> (iob: Double, cob: Double) {
+        guard let index = RheosStats.nearestIndex(sortedDates: dates, to: date) else { return (0, 0) }
+        let nearest = states[index]
+        guard abs(nearest.date.timeIntervalSince(date)) <= 20 * 60 else { return (0, 0) }
         return (max(0, nearest.iob ?? 0), max(0, nearest.cob ?? 0))
     }
 
@@ -397,7 +416,10 @@ enum RheosDeliveredBasal {
         for hour in 0 ..< 24 {
             let rows = byHour[hour].sorted { $0.day < $1.day }
             guard Set(rows.map(\.day)).count >= minimumDays,
-                  let median = RheosStats.median(rows.map(\.ratio))
+                  let newestDay = rows.last?.day,
+                  let median = RheosStats.weightedMedian(rows.map {
+                      (value: $0.ratio, weight: RheosReference.recencyWeight($0.day, newest: newestDay))
+                  })
             else { continue }
             let half = rows.count / 2
             guard let older = RheosStats.median(rows.prefix(half).map(\.ratio)),

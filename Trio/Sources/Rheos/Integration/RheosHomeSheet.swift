@@ -16,6 +16,16 @@ struct RheosHomeSheet: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section("Modus") {
+                    // The status that used to sit on the home screen. Switching to Scharf keeps its
+                    // preview and confirmation in Settings → Rheos.
+                    RheosModeBanner()
+                    if RheosModeStore.current != .scharf {
+                        Text("Scharf wird in Einstellungen → Rheos eingeschaltet, mit Vorschau und Bestätigung.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 RheosPromptList(resolver: resolver)
                 Section("Chat") {
                     TextField("Frage", text: $question)
