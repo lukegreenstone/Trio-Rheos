@@ -164,7 +164,8 @@ enum RheosSignalCatalog {
         "Schritte",
         "Aktivenergie",
         "Workout-Minuten",
-        "Schlaf-Stunden"
+        "Schlaf-Stunden",
+        "Erholungsindex"
     ]
 
     /// Only names Luke has accepted. Anything else stays out of the dosing features.
@@ -188,6 +189,7 @@ enum RheosSignalCatalog {
         case "Aktivenergie": return (day?.activeEnergy ?? 0) / 500
         case "Workout-Minuten": return (day?.workoutMinutes ?? 0) / 60
         case "Schlaf-Stunden": return (day?.sleepHours ?? 0) / 8
+        case "Erholungsindex": return ((day?.recoveryScore ?? 50) - 50) / 15
         default: return 0
         }
     }

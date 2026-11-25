@@ -20,6 +20,7 @@ struct RheosHomeSheet: View {
                     // The status that used to sit on the home screen. Switching to Scharf keeps its
                     // preview and confirmation in Settings → Rheos.
                     RheosModeBanner()
+                    RheosRecoveryRow(resolver: resolver)
                     if RheosModeStore.current != .scharf {
                         Text("Scharf wird in Einstellungen → Rheos eingeschaltet, mit Vorschau und Bestätigung.")
                             .font(.footnote)
@@ -488,6 +489,41 @@ enum RheosTeamPDF {
             return url
         } catch {
             return nil
+        }
+    }
+}
+
+/// Today's recovery from Health and what Rheos learned about its effect on insulin need.
+struct RheosRecoveryRow: View {
+    let resolver: Resolver
+    @State private var headline = ""
+    @State private var detail = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(headline.isEmpty ? "Erholung wird berechnet…" : headline)
+                .font(.footnote)
+            if !detail.isEmpty {
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .task {
+            let basal = RheosChatEngine.scheduledBasal(resolver: resolver)
+            let accepted = RheosStore.shared.loadDocument().acceptedSignals.contains(RheosRecovery.signalName)
+            let result = await Task.detached(priority: .utility) { () -> (String, String) in
+                let status = RheosRecovery.status(
+                    dataset: RheosStore.shared.loadDataset(),
+                    scheduledBasal: basal,
+                    accepted: accepted,
+                    now: Date(),
+                    calendar: .current
+                )
+                return (status.headline, status.detail)
+            }.value
+            headline = result.0
+            detail = result.1
         }
     }
 }

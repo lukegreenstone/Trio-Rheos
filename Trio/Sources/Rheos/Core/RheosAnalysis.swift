@@ -174,7 +174,8 @@ enum RheosAnalysis {
             ("Schritte", { $0.steps }),
             ("Aktivenergie", { $0.activeEnergy }),
             ("Workout-Minuten", { $0.workoutMinutes }),
-            ("Schlaf-Stunden", { $0.sleepHours })
+            ("Schlaf-Stunden", { $0.sleepHours }),
+            ("Erholungsindex", { $0.recoveryScore })
         ]
         var glucoseByDay: [Date: [Double]] = [:]
         for point in dataset.glucose where point.mgdl.isFinite && point.mgdl > 0 {

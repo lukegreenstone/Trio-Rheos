@@ -142,7 +142,12 @@ enum RheosLearner {
             )
         }
 
-        let contexts = RheosContextInference.infer(dataset: dataset, targets: targets, now: now, calendar: calendar)
+        // Recovery moves today's need only after the user accepted the signal, and only with a
+        // learned, consistent effect. Otherwise the two fixed rules stay as they were.
+        let recovery = acceptedSignals.contains(RheosRecovery.signalName)
+            ? RheosRecovery.effect(dataset: dataset, scheduledBasal: scheduledBasal, calendar: calendar)
+            : nil
+        let contexts = RheosContextInference.infer(dataset: dataset, targets: targets, recovery: recovery, now: now, calendar: calendar)
         let need = RheosContextInference.insulinNeedByHour(contexts, maxNudge: limits.maxContextNudge, now: now, calendar: calendar)
         // The stored vector is the slow glucose model only. Context is applied
         // on top for this loop and is not written back into that vector, so a

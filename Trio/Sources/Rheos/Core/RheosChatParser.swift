@@ -45,7 +45,7 @@ enum RheosChatParser {
 enum RheosChatTools {
     static let guidance = """
     Du hast Werkzeuge, die echte Daten dieser Person auf dem iPhone lesen: glucose_by_hour, day_summary, \
-    meal_outcomes, learned_factors, delivered_basal, activity. Rufe sie auf, bevor du über Muster, Tage, \
+    meal_outcomes, learned_factors, delivered_basal, activity, recovery. Rufe sie auf, bevor du über Muster, Tage, \
     Mahlzeiten oder Einstellungen sprichst, und nenne die Zahlen daraus. Erfinde keine Werte. Die Werkzeuge \
     lesen nur. Sie dosieren nicht und ändern keine Einstellung.
     """
@@ -81,6 +81,11 @@ enum RheosChatTools {
                 "activity",
                 "Workouts and sleep from Apple Health over the last days.",
                 properties: ["days": integer("Days back, 1 to 30. Default 7.")]
+            ),
+            function(
+                "recovery",
+                "Recovery score per day (0–100 from HRV, resting heart rate and sleep against the person's own 30 days) and what Rheos learned about how recovery moves this person's insulin need.",
+                properties: ["days": integer("Days back, 1 to 45. Default 14.")]
             )
         ]
     }
@@ -132,6 +137,8 @@ enum RheosChatTools {
             return deliveredBasal(dataset, scheduledBasal: scheduledBasal, calendar: calendar)
         case "activity":
             return activity(dataset, days: days(7, 30), now: now, calendar: calendar)
+        case "recovery":
+            return recovery(dataset, days: days(14, 45), scheduledBasal: scheduledBasal, now: now, calendar: calendar)
         default:
             return "Unbekanntes Werkzeug \(name)."
         }
@@ -297,6 +304,28 @@ enum RheosChatTools {
                 lines.append(String(format: "%@ %.1f", dayFormat.string(from: night), seconds / 3600))
             }
         }
+        return lines.joined(separator: "\n")
+    }
+
+    static func recovery(_ dataset: RheosDataset, days: Int, scheduledBasal: [Double], now: Date, calendar: Calendar) -> String {
+        let start = calendar.startOfDay(for: now.addingTimeInterval(-Double(days) * 86400))
+        let rows = dataset.wearableDays.filter { $0.day >= start }.sorted { $0.day > $1.day }
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.locale = Locale(identifier: "de_DE")
+        formatter.dateFormat = "EE dd.MM."
+        func value(_ number: Double?, _ format: String) -> String {
+            number.map { String(format: format, $0) } ?? "–"
+        }
+        var lines = ["Tag | Erholung | HRV ms | Ruhepuls | Schlaf h"]
+        for row in rows {
+            lines.append(
+                "\(formatter.string(from: row.day)) | \(value(row.recoveryScore, "%.0f")) | \(value(row.hrvSDNN, "%.0f")) | \(value(row.restingHeartRate, "%.0f")) | \(value(row.sleepHours, "%.1f"))"
+            )
+        }
+        let status = RheosRecovery.status(dataset: dataset, scheduledBasal: scheduledBasal, accepted: false, now: now, calendar: calendar)
+        lines.append(status.detail)
         return lines.joined(separator: "\n")
     }
 

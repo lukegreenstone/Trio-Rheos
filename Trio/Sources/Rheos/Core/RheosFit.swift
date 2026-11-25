@@ -432,3 +432,67 @@ enum RheosDeliveredBasal {
         return result
     }
 }
+
+extension RheosDeliveredBasal {
+    /// Temps as the pump ran them: a newer temp ends the one before it.
+    static func spans(_ insulin: [RheosInsulinEvent]) -> [(start: Date, end: Date, rate: Double)] {
+        let temps = insulin
+            .filter { $0.kind == "tempBasal" && $0.rate != nil && ($0.minutes ?? 0) > 0 }
+            .sorted { $0.date < $1.date }
+        var spans: [(start: Date, end: Date, rate: Double)] = []
+        for (index, temp) in temps.enumerated() {
+            var end = temp.date.addingTimeInterval((temp.minutes ?? 0) * 60)
+            if index + 1 < temps.count { end = min(end, temps[index + 1].date) }
+            if end > temp.date { spans.append((temp.date, end, max(0, temp.rate ?? 0))) }
+        }
+        return spans
+    }
+
+    /// Insulin the loop delivered on its own per calendar day: scheduled basal where no temp ran,
+    /// the temps, and SMBs. Manual boluses are left out. Only days with glucose for most of the day
+    /// and at least 24 temps count, so a day without loop data is not read as a low need.
+    static func dailyAutomatic(dataset: RheosDataset, scheduledBasal: [Double], calendar: Calendar) -> [Date: Double] {
+        guard scheduledBasal.count == 24, scheduledBasal.allSatisfy({ $0.isFinite && $0 >= 0 }) else { return [:] }
+        let runs = Self.spans(dataset.insulin)
+        guard !runs.isEmpty else { return [:] }
+        var glucoseCount: [Date: Int] = [:]
+        for point in dataset.glucose where point.mgdl > 0 {
+            glucoseCount[calendar.startOfDay(for: point.date), default: 0] += 1
+        }
+        var tempCount: [Date: Int] = [:]
+        for span in runs {
+            tempCount[calendar.startOfDay(for: span.start), default: 0] += 1
+        }
+        var smbByDay: [Date: Double] = [:]
+        for smb in dataset.insulin where smb.kind == "smb" {
+            smbByDay[calendar.startOfDay(for: smb.date), default: 0] += smb.units
+        }
+        var result: [Date: Double] = [:]
+        var spanCursor = 0
+        for day in glucoseCount.keys.sorted() {
+            guard (glucoseCount[day] ?? 0) >= 200, (tempCount[day] ?? 0) >= 24,
+                  let dayEnd = calendar.date(byAdding: .day, value: 1, to: day) else { continue }
+            var total = smbByDay[day] ?? 0
+            var hourStart = day
+            while hourStart < dayEnd {
+                let hourEnd = min(hourStart.addingTimeInterval(3600), dayEnd)
+                let hour = calendar.component(.hour, from: hourStart)
+                while spanCursor < runs.count, runs[spanCursor].end <= hourStart { spanCursor += 1 }
+                var covered: TimeInterval = 0
+                var index = spanCursor
+                while index < runs.count, runs[index].start < hourEnd {
+                    let overlap = min(runs[index].end, hourEnd).timeIntervalSince(max(runs[index].start, hourStart))
+                    if overlap > 0 {
+                        covered += overlap
+                        total += runs[index].rate * overlap / 3600
+                    }
+                    index += 1
+                }
+                total += scheduledBasal[hour] * max(0, hourEnd.timeIntervalSince(hourStart) - covered) / 3600
+                hourStart = hourEnd
+            }
+            result[day] = total
+        }
+        return result
+    }
+}

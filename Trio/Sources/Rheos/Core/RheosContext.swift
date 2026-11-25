@@ -15,12 +15,24 @@ struct RheosInferredContext: Equatable, Identifiable {
 }
 
 enum RheosContextInference {
-    static func infer(dataset: RheosDataset, targets: RheosTargetSchedule = .flat(RheosReference.missingTargetFallbackMgdl), now: Date, calendar: Calendar) -> [RheosInferredContext] {
+    static func infer(
+        dataset: RheosDataset,
+        targets: RheosTargetSchedule = .flat(RheosReference.missingTargetFallbackMgdl),
+        recovery: RheosRecovery.Effect? = nil,
+        now: Date,
+        calendar: Calendar
+    ) -> [RheosInferredContext] {
         var found: [RheosInferredContext] = []
         found.append(contentsOf: workouts(dataset.workouts, now: now))
         if let steps = steps(dataset.wearableDays, now: now, calendar: calendar) { found.append(steps) }
-        if let pulse = restingHeart(dataset.wearableDays, now: now, calendar: calendar) { found.append(pulse) }
-        if let sleep = shortSleep(dataset.sleep, now: now, calendar: calendar) { found.append(sleep) }
+        // A learned recovery effect replaces the two fixed rules below: it already contains resting
+        // heart rate and sleep, and it uses this person's own response instead of +8 % and +6 %.
+        if let recovery, let context = recoveryContext(recovery, days: dataset.wearableDays, now: now, calendar: calendar) {
+            found.append(context)
+        } else {
+            if let pulse = restingHeart(dataset.wearableDays, now: now, calendar: calendar) { found.append(pulse) }
+            if let sleep = shortSleep(dataset.sleep, now: now, calendar: calendar) { found.append(sleep) }
+        }
         if let rise = unannouncedRise(dataset: dataset, targets: targets, now: now, calendar: calendar) { found.append(rise) }
         if routineIsUnsettled(dataset: dataset, now: now, calendar: calendar) {
             found = found.map { context in
@@ -130,6 +142,27 @@ enum RheosContextInference {
         )
     }
 
+    private static func recoveryContext(
+        _ effect: RheosRecovery.Effect,
+        days: [RheosWearableDay],
+        now: Date,
+        calendar: Calendar
+    ) -> RheosInferredContext? {
+        let today = calendar.startOfDay(for: now)
+        guard let score = days.first(where: { calendar.isDate($0.day, inSameDayAs: today) })?.recoveryScore else { return nil }
+        let need = effect.need(forScore: score)
+        guard abs(need - 1) >= 0.01 else { return nil }
+        let change = Int(((need - 1) * 100).rounded())
+        return RheosInferredContext(
+            id: "recovery",
+            title: "Erholung \(Int(score.rounded()))/100",
+            summary: "Aus HRV, Ruhepuls und Schlaf gegen deine eigenen 30 Tage. Gelernt aus \(effect.days) Tagen: heute \(change > 0 ? "+" : "")\(change) % Insulinbedarf.",
+            insulinNeed: need,
+            from: today,
+            until: calendar.date(byAdding: .day, value: 1, to: today) ?? now.addingTimeInterval(12 * 3600)
+        )
+    }
+
     private static func restingHeart(_ days: [RheosWearableDay], now: Date, calendar: Calendar) -> RheosInferredContext? {
         let today = calendar.startOfDay(for: now)
         guard let current = days.first(where: { calendar.startOfDay(for: $0.day) == today })?.restingHeartRate else { return nil }
@@ -210,5 +243,152 @@ enum RheosContextInference {
             return point.mgdl
         }
         return RheosStats.median(values) ?? targets.value(atHour: hour)
+    }
+}
+
+/// Daily recovery the way recovery apps score a night, from the person's own baselines: HRV above
+/// the usual raises it, resting heart rate above the usual lowers it, sleep shorter than usual lowers
+/// it. Each day is compared with the 30 days before it. 50 is an ordinary day.
+///
+/// How recovery moves insulin need is not assumed. It is learned from the person's own days: the
+/// insulin the loop delivered on its own that day, against the median of the 14 days before. The
+/// effect is used only with at least 21 such days, a correlation of at least 0.25 and the same
+/// direction in the older and the newer half, and only after the user accepted the signal
+/// "Erholungsindex" in Rheos Vorschläge. It enters as a same-day context inside the context cap.
+enum RheosRecovery {
+    static let signalName = "Erholungsindex"
+    static let baselineDays = 30
+    static let minimumBaselineDays = 7
+    static let minimumEffectDays = 21
+    /// Largest change in insulin need per standard deviation of recovery.
+    static let maximumPerZ = 0.08
+
+    struct Effect: Equatable {
+        /// Change in the day's insulin need per standard deviation (15 points) of recovery.
+        var perZ: Double
+        var days: Int
+        var correlation: Double
+
+        func need(forScore score: Double) -> Double {
+            1 + perZ * (score - 50) / 15
+        }
+
+        var summary: String {
+            let worse = Int((abs(perZ) * 100).rounded())
+            let direction = perZ < 0 ? "mehr" : "weniger"
+            return "Gelernt aus \(days) Tagen (r = \(String(format: "%.2f", correlation))): je 15 Punkte schlechtere Erholung etwa \(worse) % \(direction) Insulin."
+        }
+    }
+
+    static func annotate(_ days: [RheosWearableDay], calendar: Calendar) -> [RheosWearableDay] {
+        let sorted = days.sorted { $0.day < $1.day }
+        return sorted.enumerated().map { index, day in
+            var copy = day
+            let history = Array(sorted[max(0, index - baselineDays) ..< index])
+            copy.recoveryScore = score(day, history: history)
+            return copy
+        }
+    }
+
+    static func score(_ day: RheosWearableDay, history: [RheosWearableDay]) -> Double? {
+        var parts: [(z: Double, weight: Double)] = []
+        if let z = zScore(day.hrvSDNN, history.compactMap(\.hrvSDNN)) { parts.append((z, 0.45)) }
+        if let z = zScore(day.restingHeartRate, history.compactMap(\.restingHeartRate)) { parts.append((-z, 0.35)) }
+        if let z = zScore(day.sleepHours, history.compactMap(\.sleepHours)) { parts.append((z, 0.20)) }
+        // Sleep alone is not a recovery score; HRV or resting heart rate has to be there.
+        guard parts.contains(where: { $0.weight >= 0.35 }) else { return nil }
+        let total = parts.reduce(0) { $0 + $1.weight }
+        let combined = parts.reduce(0) { $0 + $1.z * $1.weight } / total
+        return min(100, max(0, 50 + 15 * combined))
+    }
+
+    private static func zScore(_ value: Double?, _ history: [Double]) -> Double? {
+        let usable = history.filter(\.isFinite)
+        guard let value, value.isFinite, usable.count >= minimumBaselineDays, let mean = RheosStats.mean(usable) else { return nil }
+        let variance = usable.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Double(usable.count - 1)
+        let spread = max(variance.squareRoot(), abs(mean) * 0.05, 0.001)
+        return min(3, max(-3, (value - mean) / spread))
+    }
+
+    /// Pairs of (day, recovery in standard deviations, automatic insulin / usual).
+    static func pairs(dataset: RheosDataset, scheduledBasal: [Double], calendar: Calendar) -> [(day: Date, z: Double, ratio: Double)] {
+        let automatic = RheosDeliveredBasal.dailyAutomatic(dataset: dataset, scheduledBasal: scheduledBasal, calendar: calendar)
+            .sorted { $0.key < $1.key }
+        var scoreByDay: [Date: Double] = [:]
+        for day in dataset.wearableDays {
+            if let score = day.recoveryScore { scoreByDay[calendar.startOfDay(for: day.day)] = score }
+        }
+        var result: [(day: Date, z: Double, ratio: Double)] = []
+        for (index, entry) in automatic.enumerated() {
+            let before = automatic[max(0, index - 14) ..< index].map { $0.value }
+            guard before.count >= 7, let usual = RheosStats.median(before), usual > 0,
+                  let score = scoreByDay[entry.key] else { continue }
+            result.append((entry.key, (score - 50) / 15, entry.value / usual))
+        }
+        return result
+    }
+
+    static func effect(dataset: RheosDataset, scheduledBasal: [Double], calendar: Calendar) -> Effect? {
+        let data = pairs(dataset: dataset, scheduledBasal: scheduledBasal, calendar: calendar)
+        guard data.count >= minimumEffectDays, let all = fit(data.map { ($0.z, $0.ratio - 1) }) else { return nil }
+        let half = data.count / 2
+        guard let older = fit(data.prefix(half).map { ($0.z, $0.ratio - 1) }),
+              let newer = fit(data.suffix(data.count - half).map { ($0.z, $0.ratio - 1) }),
+              older.slope * newer.slope > 0,
+              abs(all.correlation) >= 0.25
+        else { return nil }
+        return Effect(
+            perZ: min(maximumPerZ, max(-maximumPerZ, all.slope)),
+            days: data.count,
+            correlation: all.correlation
+        )
+    }
+
+    /// Two lines for the Rheos sheet: today's recovery, and what was learned from it.
+    static func status(
+        dataset: RheosDataset,
+        scheduledBasal: [Double],
+        accepted: Bool,
+        now: Date,
+        calendar: Calendar
+    ) -> (headline: String, detail: String) {
+        let today = dataset.wearableDays.first { calendar.isDate($0.day, inSameDayAs: now) }
+        var headline: String
+        if let today, let score = today.recoveryScore {
+            var parts = ["Erholung heute \(Int(score.rounded()))/100"]
+            if let hrv = today.hrvSDNN { parts.append("HRV \(Int(hrv.rounded())) ms") }
+            if let resting = today.restingHeartRate { parts.append("Ruhepuls \(Int(resting.rounded()))") }
+            if let sleep = today.sleepHours { parts.append(String(format: "Schlaf %.1f h", sleep)) }
+            headline = parts.joined(separator: " · ")
+        } else {
+            headline = "Erholung heute: noch kein Wert. Gebraucht werden HRV oder Ruhepuls aus Health und 7 Tage Basis."
+        }
+        let detail: String
+        if let effect = effect(dataset: dataset, scheduledBasal: scheduledBasal, calendar: calendar) {
+            let use = accepted
+                ? "Wirkt in Scharf auf den heutigen Bedarf."
+                : "Wirkt erst, wenn du „Erholungsindex“ in den Rheos-Vorschlägen mit Ja bestätigst."
+            detail = effect.summary + " " + use
+        } else {
+            let count = pairs(dataset: dataset, scheduledBasal: scheduledBasal, calendar: calendar).count
+            detail = "Noch kein belastbarer Zusammenhang mit deinem Insulinbedarf: \(count) von mindestens \(minimumEffectDays) Tagen mit Erholung und Loop-Daten, oder die Tage zeigen keine einheitliche Richtung."
+        }
+        headline = headline.replacingOccurrences(of: "  ", with: " ")
+        return (headline, detail)
+    }
+
+    private static func fit(_ points: [(x: Double, y: Double)]) -> (slope: Double, correlation: Double)? {
+        guard points.count >= 4 else { return nil }
+        let n = Double(points.count)
+        let meanX = points.reduce(0) { $0 + $1.x } / n
+        let meanY = points.reduce(0) { $0 + $1.y } / n
+        var sxx = 0.0, syy = 0.0, sxy = 0.0
+        for point in points {
+            sxx += (point.x - meanX) * (point.x - meanX)
+            syy += (point.y - meanY) * (point.y - meanY)
+            sxy += (point.x - meanX) * (point.y - meanY)
+        }
+        guard sxx > 1e-9, syy > 1e-12 else { return nil }
+        return (sxy / sxx, sxy / (sxx * syy).squareRoot())
     }
 }

@@ -120,7 +120,7 @@ final class RheosCoordinator {
         if let healthStore = resolver.resolve(HKHealthStore.self) {
             await RheosHealthReader.requestReadAccess(store: healthStore)
             let health = await RheosHealthReader.read(store: healthStore)
-            dataset.wearableDays = health.days
+            dataset.wearableDays = RheosRecovery.annotate(health.days, calendar: .current)
             dataset.workouts = health.workouts
             dataset.sleep = health.sleep
             let measured = await RheosHealthReader.readBody(store: healthStore, now: now)

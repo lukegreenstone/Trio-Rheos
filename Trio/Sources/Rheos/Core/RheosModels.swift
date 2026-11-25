@@ -236,6 +236,8 @@ struct RheosWearableDay: Codable, Equatable, Identifiable {
     var activeEnergy: Double? = nil
     var workoutMinutes: Double? = nil
     var sleepHours: Double? = nil
+    /// 0–100 from HRV, resting heart rate and sleep against the person's own 30 days (`RheosRecovery`).
+    var recoveryScore: Double? = nil
 }
 
 struct RheosWorkout: Codable, Equatable, Identifiable {

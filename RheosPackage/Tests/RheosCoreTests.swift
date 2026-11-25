@@ -514,6 +514,48 @@ final class RheosCoreTests: XCTestCase {
         XCTAssertGreaterThan(at100.learnedFactors.basal[8], at120.learnedFactors.basal[8])
     }
 
+    func testRecoveryScoreFollowsHRVRestingHeartAndSleep() {
+        let history = (1 ... 20).map { day in
+            RheosWearableDay(
+                day: date(day: day, hour: 0),
+                restingHeartRate: day.isMultiple(of: 2) ? 54 : 56,
+                hrvSDNN: day.isMultiple(of: 2) ? 48 : 52,
+                sleepHours: day.isMultiple(of: 2) ? 7 : 8
+            )
+        }
+        let poor = RheosWearableDay(day: date(day: 21, hour: 0), restingHeartRate: 64, hrvSDNN: 34, sleepHours: 5)
+        let good = RheosWearableDay(day: date(day: 21, hour: 0), restingHeartRate: 50, hrvSDNN: 66, sleepHours: 8.5)
+        XCTAssertLessThan(RheosRecovery.score(poor, history: history) ?? 100, 30)
+        XCTAssertGreaterThan(RheosRecovery.score(good, history: history) ?? 0, 70)
+        XCTAssertNil(RheosRecovery.score(RheosWearableDay(day: date(day: 21, hour: 0), sleepHours: 5), history: history))
+    }
+
+    func testRecoveryEffectIsLearnedFromThePersonsOwnDays() {
+        var glucose: [RheosGlucosePoint] = []
+        var insulin: [RheosInsulinEvent] = []
+        var wearable: [RheosWearableDay] = []
+        for day in 1 ... 30 {
+            let score = [35.0, 50.0, 65.0][day % 3]
+            // Poor recovery: the loop needed more insulin that day.
+            let rate = 1 + (50 - score) / 15 * 0.15
+            for hour in 0 ..< 24 {
+                for minute in stride(from: 0, to: 60, by: 5) {
+                    glucose.append(RheosGlucosePoint(date: date(day: day, hour: hour, minute: minute), mgdl: 115))
+                }
+                for minute in [0, 30] {
+                    insulin.append(RheosInsulinEvent(date: date(day: day, hour: hour, minute: minute), units: rate / 2, kind: "tempBasal", rate: rate, minutes: 30))
+                }
+            }
+            wearable.append(RheosWearableDay(day: date(day: day, hour: 0), recoveryScore: score))
+        }
+        let dataset = RheosDataset(glucose: glucose, insulin: insulin, wearableDays: wearable)
+        let effect = RheosRecovery.effect(dataset: dataset, scheduledBasal: Array(repeating: 1, count: 24), calendar: calendar)
+        XCTAssertNotNil(effect)
+        XCTAssertLessThan(effect?.perZ ?? 0, 0)
+        XCTAssertGreaterThan(effect?.need(forScore: 35) ?? 0, 1)
+        XCTAssertLessThan(effect?.need(forScore: 65) ?? 2, 1)
+    }
+
     func testDeliveredInsulinTeachesBasalInQuietHours() {
         var glucose: [RheosGlucosePoint] = []
         var insulin: [RheosInsulinEvent] = []
