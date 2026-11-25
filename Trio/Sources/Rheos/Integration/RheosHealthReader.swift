@@ -60,6 +60,8 @@ enum RheosHealthReader {
             }
         }
         types.insert(HKObjectType.workoutType())
+        // Beat-to-beat series the watch records with each HRV reading, for RMSSD during sleep.
+        types.insert(HKSeriesType.heartbeat())
         if let sleep = HKObjectType.categoryType(forIdentifier: .sleepAnalysis) {
             types.insert(sleep)
         }
@@ -407,6 +409,188 @@ enum RheosHealthReader {
         default: return "other"
         }
     }
+}
+
+/// Nights for the recovery score, Bevel-style: one sleep window per night, and heart rate, HRV,
+/// breathing rate, wrist temperature and blood oxygen only from inside that window.
+extension RheosHealthReader {
+    static let nightCacheKey = "rheos.nights.v1"
+    static let nightFullReadKey = "rheos.nights.fullRead"
+    /// Beat-to-beat series read per night; the watch records a few per night.
+    static let seriesPerNight = 8
+
+    /// The nights of the last `RheosRecovery.historyDays`. Older nights come from a cache, so the
+    /// full history is read from Health once and then checked once a day; in between only the last
+    /// days are read. The last three nights are measured again each time because the watch syncs
+    /// late, and a night of the last week without heart data is retried at the daily check.
+    static func nights(store: HKHealthStore, now: Date = Date(), calendar: Calendar = .current) async -> [RheosNight] {
+        guard HKHealthStore.isHealthDataAvailable() else { return [] }
+        let defaults = UserDefaults.standard
+        let earliest = calendar.startOfDay(for: calendar.date(byAdding: .day, value: -RheosRecovery.historyDays, to: now) ?? now)
+        var byDay: [Date: RheosNight] = [:]
+        for night in loadNights(defaults) where night.day >= earliest {
+            byDay[night.day] = night
+        }
+        let today = calendar.startOfDay(for: now)
+        let fresh = calendar.date(byAdding: .day, value: -3, to: today) ?? today
+        let week = calendar.date(byAdding: .day, value: -7, to: today) ?? today
+        let full = byDay.isEmpty || now.timeIntervalSince1970 - defaults.double(forKey: nightFullReadKey) > 24 * 3600
+        let readFrom = full ? earliest.addingTimeInterval(-86400) : today.addingTimeInterval(-5 * 86400)
+        let samples = await sleepSamples(store: store, start: readFrom, end: now)
+        // A locked iPhone reads nothing from Health; the cache stays as it is.
+        guard !samples.isEmpty else { return byDay.values.sorted { $0.day < $1.day } }
+        var measured = 0
+        var current: Set<Date> = []
+        let windows = RheosSleepNights.windows(samples, calendar: calendar)
+            .filter { $0.day >= (full ? earliest : fresh) }
+        // Newest first, so a first run that is cut short already has the nights that matter.
+        for window in windows.reversed() {
+            current.insert(window.day)
+            if let old = byDay[window.day],
+               abs(old.start.timeIntervalSince(window.start)) < 120,
+               abs(old.end.timeIntervalSince(window.end)) < 120,
+               window.day < fresh,
+               old.sleepingHeartRate != nil || old.hrvSDNN != nil || window.day < week {
+                continue
+            }
+            byDay[window.day] = await measure(window, store: store)
+            measured += 1
+            if measured.isMultiple(of: 15) { saveNights(Array(byDay.values), defaults: defaults) }
+        }
+        // A full read also drops nights that are no longer in Health; a short read keeps the older ones.
+        let result = byDay.values
+            .filter { !full || current.contains($0.day) }
+            .sorted { $0.day < $1.day }
+        saveNights(result, defaults: defaults)
+        if full { defaults.set(now.timeIntervalSince1970, forKey: nightFullReadKey) }
+        return result
+    }
+
+    private static func measure(_ window: RheosSleepNights.Window, store: HKHealthStore) async -> RheosNight {
+        var night = RheosNight(
+            day: window.day,
+            start: window.start,
+            end: window.end,
+            asleepHours: window.asleepHours,
+            deepHours: window.deepHours,
+            remHours: window.remHours,
+            awakeHours: window.awakeHours
+        )
+        let perMinute = HKUnit.count().unitDivided(by: .minute())
+        night.sleepingHeartRate = await average(store, .heartRate, perMinute, window.start, window.end)
+        night.hrvSDNN = await average(store, .heartRateVariabilitySDNN, HKUnit.secondUnit(with: .milli), window.start, window.end)
+        night.respiratoryRate = await average(store, .respiratoryRate, perMinute, window.start, window.end)
+        night.oxygenSaturation = await average(store, .oxygenSaturation, .percent(), window.start, window.end).map { $0 * 100 }
+        // The watch stores one wrist temperature per night, dated around the sleep.
+        night.wristTemperature = await average(
+            store,
+            .appleSleepingWristTemperature,
+            .degreeCelsius(),
+            window.start.addingTimeInterval(-2 * 3600),
+            window.end.addingTimeInterval(2 * 3600)
+        )
+        night.hrvRMSSD = await rmssd(store: store, start: window.start, end: window.end)
+        return night
+    }
+
+    private static func average(
+        _ store: HKHealthStore,
+        _ identifier: HKQuantityTypeIdentifier,
+        _ unit: HKUnit,
+        _ start: Date,
+        _ end: Date
+    ) async -> Double? {
+        guard let type = HKQuantityType.quantityType(forIdentifier: identifier) else { return nil }
+        return await withCheckedContinuation { continuation in
+            let resumed = ResumeOnce()
+            let query = HKStatisticsQuery(
+                quantityType: type,
+                quantitySamplePredicate: HKQuery.predicateForSamples(withStart: start, end: end, options: []),
+                options: .discreteAverage
+            ) { _, statistics, _ in
+                resumed.resume(continuation, returning: statistics?.averageQuantity()?.doubleValue(for: unit))
+            }
+            store.execute(query)
+        }
+    }
+
+    private static func rmssd(store: HKHealthStore, start: Date, end: Date) async -> Double? {
+        let series: [HKHeartbeatSeriesSample] = await withCheckedContinuation { continuation in
+            let resumed = ResumeOnce()
+            let query = HKSampleQuery(
+                sampleType: HKSeriesType.heartbeat(),
+                predicate: HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate),
+                limit: seriesPerNight,
+                sortDescriptors: [NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)]
+            ) { _, samples, _ in
+                resumed.resume(continuation, returning: (samples as? [HKHeartbeatSeriesSample]) ?? [])
+            }
+            store.execute(query)
+        }
+        var values: [Double] = []
+        for sample in series {
+            let beats = await heartbeats(store: store, series: sample)
+            if let value = RheosRecovery.rmssd(beats) { values.append(value) }
+        }
+        return RheosStats.median(values)
+    }
+
+    private static func heartbeats(store: HKHealthStore, series: HKHeartbeatSeriesSample) async -> [(time: Double, gap: Bool)] {
+        await withCheckedContinuation { continuation in
+            let resumed = ResumeOnce()
+            let collector = BeatCollector()
+            let query = HKHeartbeatSeriesQuery(heartbeatSeries: series) { _, time, gap, done, error in
+                if error != nil {
+                    resumed.resume(continuation, returning: collector.beats)
+                    return
+                }
+                collector.beats.append((time: time, gap: gap))
+                if done { resumed.resume(continuation, returning: collector.beats) }
+            }
+            store.execute(query)
+        }
+    }
+
+    private static func sleepSamples(store: HKHealthStore, start: Date, end: Date) async -> [RheosSleepNights.Sample] {
+        guard let type = HKObjectType.categoryType(forIdentifier: .sleepAnalysis) else { return [] }
+        return await withCheckedContinuation { continuation in
+            let resumed = ResumeOnce()
+            let query = HKSampleQuery(
+                sampleType: type,
+                predicate: HKQuery.predicateForSamples(withStart: start, end: end, options: []),
+                limit: HKObjectQueryNoLimit,
+                sortDescriptors: [NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)]
+            ) { _, samples, _ in
+                let result = (samples as? [HKCategorySample])?.map { sample in
+                    RheosSleepNights.Sample(
+                        start: sample.startDate,
+                        end: sample.endDate,
+                        stage: sleepStage(sample.value),
+                        source: sample.sourceRevision.source.bundleIdentifier
+                    )
+                } ?? []
+                resumed.resume(continuation, returning: result)
+            }
+            store.execute(query)
+        }
+    }
+
+    static func loadNights(_ defaults: UserDefaults = .standard) -> [RheosNight] {
+        guard let data = defaults.data(forKey: nightCacheKey) else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        return (try? decoder.decode([RheosNight].self, from: data)) ?? []
+    }
+
+    private static func saveNights(_ nights: [RheosNight], defaults: UserDefaults = .standard) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .secondsSince1970
+        if let data = try? encoder.encode(nights.sorted { $0.day < $1.day }) { defaults.set(data, forKey: nightCacheKey) }
+    }
+}
+
+private final class BeatCollector: @unchecked Sendable {
+    var beats: [(time: Double, gap: Bool)] = []
 }
 
 private final class ResumeOnce: @unchecked Sendable {

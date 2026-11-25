@@ -247,8 +247,36 @@ struct RheosWearableDay: Codable, Equatable, Identifiable {
     var activeEnergy: Double? = nil
     var workoutMinutes: Double? = nil
     var sleepHours: Double? = nil
-    /// 0–100 from HRV, resting heart rate and sleep against the person's own 30 days (`RheosRecovery`).
+    /// 0–100, 50 is this person's usual morning (`RheosRecovery`). From the night before this day.
     var recoveryScore: Double? = nil
+    /// 0–100 from duration against the person's own need, efficiency, deep and REM sleep, and timing.
+    var sleepScore: Double? = nil
+    /// What moved the recovery score, against this person's own nights. For the sheet and the chat.
+    var recoveryNote: String? = nil
+}
+
+/// One night's main sleep, assigned to the day the person woke up, with what Apple Health measured
+/// inside that sleep window. Bevel-style: heart rate and HRV only from the sleep window, HRV as
+/// RMSSD from the watch's beat-to-beat series where available.
+struct RheosNight: Codable, Equatable {
+    /// Start of the wake-up day.
+    var day: Date
+    var start: Date
+    var end: Date
+    var asleepHours: Double
+    var deepHours: Double? = nil
+    var remHours: Double? = nil
+    var awakeHours: Double? = nil
+    /// ms, from the beat-to-beat series recorded during the sleep window.
+    var hrvRMSSD: Double? = nil
+    /// ms, Apple's HRV (SDNN) samples during the sleep window.
+    var hrvSDNN: Double? = nil
+    /// Mean heart rate during the sleep window, not Apple's all-day resting heart rate.
+    var sleepingHeartRate: Double? = nil
+    var respiratoryRate: Double? = nil
+    var wristTemperature: Double? = nil
+    /// Percent.
+    var oxygenSaturation: Double? = nil
 }
 
 struct RheosWorkout: Codable, Equatable, Identifiable {

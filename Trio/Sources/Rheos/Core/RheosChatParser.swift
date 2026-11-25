@@ -89,7 +89,7 @@ enum RheosChatTools {
             ),
             function(
                 "recovery",
-                "Recovery score per day (0–100 from HRV, resting heart rate and sleep against the person's own 30 days) and what Rheos learned about how recovery moves this person's insulin need.",
+                "Recovery score per day (0–100, 50 is the person's usual morning), Bevel-style from the night's sleep window: HRV as RMSSD from beat-to-beat data, sleeping heart rate, a sleep score (duration against own need, deep and REM, efficiency, timing), breathing rate, wrist temperature and blood oxygen, each against the person's own last 60 nights. Also what Rheos learned about how recovery moves this person's insulin need.",
                 properties: ["days": integer("Days back, 1 to 45. Default 14.")]
             )
         ]
@@ -325,10 +325,12 @@ enum RheosChatTools {
         func value(_ number: Double?, _ format: String) -> String {
             number.map { String(format: format, $0) } ?? "–"
         }
-        var lines = ["Tag | Erholung | HRV ms | Ruhepuls | Schlaf h"]
+        var lines = ["Tag | Erholung | Schlaf-Score | Schlaf h | Gemessen in der Nacht (gegen die eigenen Nächte)"]
         for row in rows {
+            let detail = row.recoveryNote
+                ?? "HRV Tag \(value(row.hrvSDNN, "%.0f")) ms, Ruhepuls \(value(row.restingHeartRate, "%.0f"))"
             lines.append(
-                "\(formatter.string(from: row.day)) | \(value(row.recoveryScore, "%.0f")) | \(value(row.hrvSDNN, "%.0f")) | \(value(row.restingHeartRate, "%.0f")) | \(value(row.sleepHours, "%.1f"))"
+                "\(formatter.string(from: row.day)) | \(value(row.recoveryScore, "%.0f")) | \(value(row.sleepScore, "%.0f")) | \(value(row.sleepHours, "%.1f")) | \(detail)"
             )
         }
         let status = RheosRecovery.status(dataset: dataset, scheduledBasal: scheduledBasal, accepted: false, now: now, calendar: calendar)

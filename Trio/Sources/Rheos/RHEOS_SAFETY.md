@@ -171,6 +171,19 @@ With the Cloud-Auswertung switch and a key, the chat can call read-only tools (`
 
 A refresh runs at most every 25 minutes unless the mode changes or the settings button asks for it, trains the core model once, at utility priority, and skips the small network in Low Power Mode. The Rheos file is written two seconds after the last change in a row, without indentation, and once more when the app goes to the background. Nearest loop states are found by binary search.
 
+## Recovery index
+
+`RheosRecovery` scores each morning 0–100 from the night before, the way recovery apps such as Bevel do, against the person's own last 60 nights (median and MAD, read from 90 days of Apple Health; nights are cached and the full history is read at most once a day). 50 is this person's usual morning.
+
+- Night: the main sleep from one source (the one with the most sleep that night, stages preferred), overlapping samples merged, assigned to the wake-up day; naps under 3 hours are not a night.
+- HRV 40 %: RMSSD from the watch's beat-to-beat series inside the sleep window (artefacts over 25 % dropped), else Apple's SDNN inside the window, on a log scale.
+- Sleeping heart rate 25 %: the mean inside the sleep window, not Apple's all-day resting heart rate.
+- Sleep score 20 %: duration against the person's own need (their median night, kept within 7–9 hours), deep and REM share, efficiency, and timing against their usual midpoint.
+- Breathing rate and wrist temperature 5 % each, only when raised; blood oxygen 5 %, only when low.
+- Without HRV or sleeping heart rate from the night, the day falls back to the daily averages.
+
+How recovery moves insulin need is learned, not assumed: the insulin the loop delivered on its own that day against the median of the 14 days before, with at least 21 days, a correlation of at least 0.25 and the same direction in both halves, and only after the user accepted "Erholungsindex". It then enters as a same-day context inside the context cap, at most ±8 % per 15 points. A locked iPhone that reads nothing from Health keeps the stored days instead of clearing them.
+
 ## Rheos Pilot
 
 The Pilot is an own dosing rule that runs only in shadow (`RheosPilot`). At each refresh it replays the stored loops of the last weeks with the state Trio had then (glucose, 15-minute trend, IOB, COB, the ISF and carb ratio oref used, target) and decides what it would have done: no insulin when glucose or its 30/60-minute forecast is under 80, a lower temp when the forecast is below target, otherwise half the insulin needed for the target as an SMB, capped at one hour of basal. It is scored against the glucose three hours later, against oref's eventual BG, and on the loops before later lows and highs. It also compares Trio's ISF (Dynamic ISF included) with the Rheos-learned ISF on the same replay; the Rheos side uses the profile ISF times the hourly ISF factors Rheos fitted before Dynamic ISF set them to 1, so the comparison works while Dynamic ISF stays on. The JavaScript oref stores the ISF in the display unit, the Swift port in mg/dL; the replay picks the reading closer to the profile ISF. Core Data's 0 for a missing glucose, eventual BG, carb ratio or target is read as missing. It never doses. "Reif" needs 4 weeks, less insulin than oref before lows, at least as much before highs and a better forecast; switching control is a separate step the user decides and that keeps oref's limits.

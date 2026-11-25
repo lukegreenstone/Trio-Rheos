@@ -1607,6 +1607,67 @@ final class RheosCoreTests: XCTestCase {
         }
     }
 
+    func testSleepNightsUseOneSourceAndTheWakeUpDay() {
+        let watch = "com.apple.health.watch"
+        let phone = "com.apple.health.phone"
+        let samples: [RheosSleepNights.Sample] = [
+            .init(start: date(day: 20, hour: 23), end: date(day: 21, hour: 1), stage: "core", source: watch),
+            .init(start: date(day: 21, hour: 1), end: date(day: 21, hour: 2), stage: "deep", source: watch),
+            .init(start: date(day: 21, hour: 2), end: date(day: 21, hour: 2, minute: 15), stage: "awake", source: watch),
+            .init(start: date(day: 21, hour: 2, minute: 15), end: date(day: 21, hour: 5), stage: "core", source: watch),
+            .init(start: date(day: 21, hour: 5), end: date(day: 21, hour: 7), stage: "rem", source: watch),
+            // The iPhone wrote the same night again, and a nap in the afternoon.
+            .init(start: date(day: 20, hour: 23, minute: 30), end: date(day: 21, hour: 6, minute: 30), stage: "asleep", source: phone),
+            .init(start: date(day: 21, hour: 14), end: date(day: 21, hour: 15), stage: "core", source: watch)
+        ]
+        let windows = RheosSleepNights.windows(samples, calendar: calendar)
+        XCTAssertEqual(windows.count, 1)
+        XCTAssertEqual(windows.first?.day, date(day: 21, hour: 0))
+        XCTAssertEqual(windows.first?.asleepHours ?? 0, 7.75, accuracy: 0.01)
+        XCTAssertEqual(windows.first?.deepHours ?? 0, 1, accuracy: 0.01)
+        XCTAssertEqual(windows.first?.remHours ?? 0, 2, accuracy: 0.01)
+        XCTAssertEqual(windows.first?.awakeHours ?? 0, 0.25, accuracy: 0.01)
+    }
+
+    func testRMSSDFromBeatToBeatSeries() {
+        var beats: [(time: Double, gap: Bool)] = []
+        var time = 0.0
+        for index in 0 ... 60 {
+            beats.append((time: time, gap: index == 30))
+            time += index.isMultiple(of: 2) ? 1.0 : 1.05
+        }
+        XCTAssertEqual(RheosRecovery.rmssd(beats) ?? 0, 50, accuracy: 0.5)
+        XCTAssertNil(RheosRecovery.rmssd(Array(beats.prefix(10))))
+    }
+
+    func testNightRecoveryFollowsThePersonsOwnNights() {
+        func night(_ day: Int, rmssd: Double?, heart: Double?, from: Int = 23, asleep: Double = 7.5) -> RheosNight {
+            RheosNight(
+                day: date(day: day, hour: 0),
+                start: date(day: from >= 12 ? day - 1 : day, hour: from),
+                end: date(day: day, hour: 7),
+                asleepHours: asleep,
+                hrvRMSSD: rmssd,
+                sleepingHeartRate: heart,
+                respiratoryRate: 14
+            )
+        }
+        let history = (2 ... 21).map { night($0, rmssd: $0.isMultiple(of: 2) ? 38 : 42, heart: $0.isMultiple(of: 2) ? 54 : 56) }
+        let poor = RheosRecovery.score(night(22, rmssd: 25, heart: 62, from: 1, asleep: 5), history: history, calendar: calendar)
+        let good = RheosRecovery.score(night(22, rmssd: 60, heart: 50, asleep: 7.9), history: history, calendar: calendar)
+        XCTAssertLessThan(poor?.score ?? 100, 30)
+        XCTAssertGreaterThan(good?.score ?? 0, 65)
+        XCTAssertTrue(good?.note.contains("RMSSD") ?? false)
+        XCTAssertNil(RheosRecovery.score(night(22, rmssd: nil, heart: nil), history: history, calendar: calendar))
+
+        let days = (2 ... 22).map { RheosWearableDay(day: date(day: $0, hour: 0), restingHeartRate: 60, sleepHours: 11) }
+        let annotated = RheosRecovery.annotate(days, nights: history + [night(22, rmssd: 60, heart: 50, asleep: 7.9)], calendar: calendar)
+        let today = annotated.first { $0.day == date(day: 22, hour: 0) }
+        XCTAssertNotNil(today?.recoveryNote)
+        XCTAssertEqual(today?.sleepHours ?? 0, 7.9, accuracy: 0.001)
+        XCTAssertGreaterThan(today?.recoveryScore ?? 0, 65)
+    }
+
     func testPilotNeverDosesUnderEighty() {
         let inputs = RheosPilot.Inputs(glucose: 95, deltaPer5: -6, iob: 1.5, cob: 0, isf: 50, carbRatio: 10, target: 100, basal: 0.8)
         let decision = RheosPilot.decide(inputs)

@@ -120,9 +120,18 @@ final class RheosCoordinator {
         if let healthStore = resolver.resolve(HKHealthStore.self) {
             await RheosHealthReader.requestReadAccess(store: healthStore)
             let health = await RheosHealthReader.read(store: healthStore)
-            dataset.wearableDays = RheosRecovery.annotate(health.days, calendar: .current)
-            dataset.workouts = health.workouts
-            dataset.sleep = health.sleep
+            if health.days.isEmpty, health.workouts.isEmpty, health.sleep.isEmpty {
+                // A locked iPhone reads nothing from Health; keep what was there instead of clearing it.
+                dataset.wearableDays = previous.wearableDays
+                dataset.workouts = previous.workouts
+                dataset.sleep = previous.sleep
+            } else {
+                // Recovery from each night's sleep window against the person's own last 60 nights.
+                let nights = await RheosHealthReader.nights(store: healthStore, now: now)
+                dataset.wearableDays = RheosRecovery.annotate(health.days, nights: nights, calendar: .current)
+                dataset.workouts = health.workouts
+                dataset.sleep = health.sleep
+            }
             let measured = await RheosHealthReader.readBody(store: healthStore, now: now)
             let windows = await RheosHealthReader.recentSteps(store: healthStore, now: now)
             let heart = await RheosHealthReader.recentHeartRate(store: healthStore, now: now)

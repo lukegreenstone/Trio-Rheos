@@ -183,7 +183,8 @@ enum RheosContextInference {
 
     private static func shortSleep(_ sleep: [RheosSleepInterval], now: Date, calendar: Calendar) -> RheosInferredContext? {
         let recent = sleep.filter { $0.end <= now && now.timeIntervalSince($0.end) <= 20 * 3600 }
-        let hours = recent.reduce(0) { $0 + $1.end.timeIntervalSince($1.start) / 3600 }
+        // iPhone and watch can both write the same night; overlaps count once.
+        let hours = RheosSleepNights.unionHours(recent.map { (start: $0.start, end: $0.end) })
         guard hours > 0, hours < 6 else { return nil }
         let today = calendar.startOfDay(for: now)
         let from = calendar.date(bySettingHour: 5, minute: 0, second: 0, of: today) ?? today
@@ -280,14 +281,176 @@ enum RheosRecovery {
         }
     }
 
-    static func annotate(_ days: [RheosWearableDay], calendar: Calendar) -> [RheosWearableDay] {
-        let sorted = days.sorted { $0.day < $1.day }
+    /// Days back Rheos reads from Apple Health for the recovery baseline.
+    static let historyDays = 90
+    /// Nights the baseline uses, like the calibration window recovery apps use.
+    static let baselineNights = 60
+
+    /// Scores each day from the night before it. Days with a measured sleep window use the
+    /// night-based score; days without one fall back to the daily averages.
+    static func annotate(_ days: [RheosWearableDay], nights: [RheosNight] = [], calendar: Calendar) -> [RheosWearableDay] {
+        var rows: [Date: RheosWearableDay] = [:]
+        for day in days {
+            rows[calendar.startOfDay(for: day.day)] = day
+        }
+        let earliest = rows.keys.min()
+        let sortedNights = nights.sorted { $0.day < $1.day }
+        var fromNights: Set<Date> = []
+        for (index, night) in sortedNights.enumerated() {
+            let key = calendar.startOfDay(for: night.day)
+            guard let earliest, key >= earliest else { continue }
+            var row = rows[key] ?? RheosWearableDay(day: key)
+            // One sleep source, no double counting, assigned to the wake-up day.
+            row.sleepHours = night.asleepHours
+            let history = Array(sortedNights[max(0, index - baselineNights) ..< index])
+            if let result = score(night, history: history, calendar: calendar) {
+                row.recoveryScore = result.score
+                row.sleepScore = result.sleepScore
+                row.recoveryNote = result.note
+                fromNights.insert(key)
+            } else {
+                row.sleepScore = sleepScore(night, history: history, calendar: calendar)
+            }
+            rows[key] = row
+        }
+        let sorted = rows.values.sorted { $0.day < $1.day }
         return sorted.enumerated().map { index, day in
+            guard !fromNights.contains(calendar.startOfDay(for: day.day)) else { return day }
             var copy = day
             let history = Array(sorted[max(0, index - baselineDays) ..< index])
             copy.recoveryScore = score(day, history: history)
             return copy
         }
+    }
+
+    /// Recovery for the morning after `night`, against the person's own nights before it.
+    /// HRV 40 %, sleeping heart rate 25 %, sleep score 20 %, breathing rate, wrist temperature and
+    /// blood oxygen 5 % each. Breathing and temperature only lower it when raised, blood oxygen only
+    /// when low. HRV or sleeping heart rate has to be there. 50 is this person's usual morning.
+    static func score(
+        _ night: RheosNight,
+        history: [RheosNight],
+        calendar: Calendar
+    ) -> (score: Double, sleepScore: Double?, note: String)? {
+        var parts: [(z: Double, weight: Double)] = []
+        var notes: [String] = []
+        if let rmssd = night.hrvRMSSD, rmssd > 0,
+           let z = robustZ(log(rmssd), history.compactMap(\.hrvRMSSD).filter { $0 > 0 }.map { log($0) }, floor: 0.05) {
+            parts.append((z, 0.40))
+            notes.append(describe("HRV (RMSSD)", rmssd, history.compactMap(\.hrvRMSSD), "%.0f", " ms"))
+        } else if let sdnn = night.hrvSDNN, sdnn > 0,
+                  let z = robustZ(log(sdnn), history.compactMap(\.hrvSDNN).filter { $0 > 0 }.map { log($0) }, floor: 0.05) {
+            parts.append((z, 0.40))
+            notes.append(describe("HRV (SDNN)", sdnn, history.compactMap(\.hrvSDNN), "%.0f", " ms"))
+        }
+        if let heart = night.sleepingHeartRate,
+           let z = robustZ(heart, history.compactMap(\.sleepingHeartRate), floor: 1) {
+            parts.append((-z, 0.25))
+            notes.append(describe("Schlafpuls", heart, history.compactMap(\.sleepingHeartRate), "%.0f", ""))
+        }
+        guard !parts.isEmpty else { return nil }
+        let sleep = sleepScore(night, history: history, calendar: calendar)
+        if let sleep {
+            parts.append((min(3, max(-3, (sleep - 75) / 12)), 0.20))
+            notes.append(String(format: "Schlaf %.1f h, Score %.0f", night.asleepHours, sleep))
+        }
+        if let breathing = night.respiratoryRate,
+           let z = robustZ(breathing, history.compactMap(\.respiratoryRate), floor: 0.3) {
+            parts.append((-max(0, z), 0.05))
+            notes.append(describe("Atmung", breathing, history.compactMap(\.respiratoryRate), "%.1f", "/min"))
+        }
+        if let temperature = night.wristTemperature,
+           let z = robustZ(temperature, history.compactMap(\.wristTemperature), floor: 0.1),
+           let usual = RheosStats.median(history.compactMap(\.wristTemperature)) {
+            parts.append((-max(0, z), 0.05))
+            notes.append(String(format: "Temperatur %+.1f °C", temperature - usual))
+        }
+        if let oxygen = night.oxygenSaturation,
+           let z = robustZ(oxygen, history.compactMap(\.oxygenSaturation), floor: 0.5) {
+            parts.append((min(0, z), 0.05))
+            notes.append(String(format: "SpO₂ %.0f %%", oxygen))
+        }
+        let total = parts.reduce(0) { $0 + $1.weight }
+        let combined = parts.reduce(0) { $0 + $1.z * $1.weight } / total
+        let score = min(100, max(0, 50 + 15 * combined))
+        notes.append("Basis \(history.count) Nächte")
+        return (score, sleep, notes.joined(separator: " · "))
+    }
+
+    /// 0–100: duration against the person's own need (their median night, kept within 7–9 hours)
+    /// 50 %, deep and REM share 20 %, efficiency 15 %, timing against their usual midpoint 15 %.
+    static func sleepScore(_ night: RheosNight, history: [RheosNight], calendar: Calendar) -> Double? {
+        guard night.asleepHours > 0 else { return nil }
+        let need = min(9, max(7, RheosStats.median(history.map(\.asleepHours).filter { $0 >= 3 }) ?? 8))
+        var parts: [(value: Double, weight: Double)] = [(min(1, night.asleepHours / need), 0.50)]
+        let span = night.end.timeIntervalSince(night.start) / 3600
+        if span > 0 {
+            let efficiency = min(1, night.asleepHours / span)
+            parts.append((min(1, max(0, (efficiency - 0.75) / 0.20)), 0.15))
+        }
+        if let deep = night.deepHours, let rem = night.remHours {
+            parts.append((min(1, max(0, (deep + rem) / night.asleepHours / 0.40)), 0.20))
+        }
+        let midpoints = history.map { midpoint($0, calendar: calendar) }
+        if midpoints.count >= 5, let usual = RheosStats.median(midpoints) {
+            let off = abs(midpoint(night, calendar: calendar) - usual)
+            parts.append((max(0, 1 - off / 2), 0.15))
+        }
+        let total = parts.reduce(0) { $0 + $1.weight }
+        return 100 * parts.reduce(0) { $0 + $1.value * $1.weight } / total
+    }
+
+    /// Hours from noon before the wake-up day to the middle of the night, so 23:00–07:00 is 15.
+    private static func midpoint(_ night: RheosNight, calendar: Calendar) -> Double {
+        let noon = calendar.startOfDay(for: night.day).addingTimeInterval(-12 * 3600)
+        let middle = night.start.addingTimeInterval(night.end.timeIntervalSince(night.start) / 2)
+        return middle.timeIntervalSince(noon) / 3600
+    }
+
+    /// Distance from the person's own median in robust standard deviations (MAD), within ±3.
+    static func robustZ(_ value: Double, _ history: [Double], floor: Double) -> Double? {
+        let usable = history.filter(\.isFinite)
+        guard value.isFinite, usable.count >= minimumBaselineDays, let median = RheosStats.median(usable),
+              let mad = RheosStats.median(usable.map { abs($0 - median) }) else { return nil }
+        let spread = max(mad * 1.4826, floor)
+        return min(3, max(-3, (value - median) / spread))
+    }
+
+    private static func describe(_ name: String, _ value: Double, _ history: [Double], _ format: String, _ unit: String) -> String {
+        let now = String(format: format, value)
+        guard let usual = RheosStats.median(history.filter(\.isFinite)) else { return "\(name) \(now)\(unit)" }
+        return "\(name) \(now)\(unit) (üblich \(String(format: format, usual)))"
+    }
+
+    /// RMSSD in ms from a beat-to-beat series (seconds since series start, gap before the beat).
+    /// Beat intervals outside 0.3–2 s and jumps over 25 % are treated as artefacts.
+    static func rmssd(_ beats: [(time: Double, gap: Bool)]) -> Double? {
+        var previousTime: Double?
+        var previousInterval: Double?
+        var differences: [Double] = []
+        for beat in beats.sorted(by: { $0.time < $1.time }) {
+            defer { previousTime = beat.time }
+            guard let last = previousTime, !beat.gap else {
+                previousInterval = nil
+                continue
+            }
+            let interval = beat.time - last
+            guard interval >= 0.3, interval <= 2.0 else {
+                previousInterval = nil
+                continue
+            }
+            if let previous = previousInterval {
+                if abs(interval - previous) <= 0.25 * previous {
+                    differences.append(interval - previous)
+                } else {
+                    previousInterval = nil
+                    continue
+                }
+            }
+            previousInterval = interval
+        }
+        guard differences.count >= 20 else { return nil }
+        return (differences.reduce(0) { $0 + $1 * $1 } / Double(differences.count)).squareRoot() * 1000
     }
 
     static func score(_ day: RheosWearableDay, history: [RheosWearableDay]) -> Double? {
@@ -354,14 +517,16 @@ enum RheosRecovery {
     ) -> (headline: String, detail: String) {
         let today = dataset.wearableDays.first { calendar.isDate($0.day, inSameDayAs: now) }
         var headline: String
-        if let today, let score = today.recoveryScore {
+        if let today, let score = today.recoveryScore, let note = today.recoveryNote {
+            headline = "Erholung heute \(Int(score.rounded()))/100 · \(note)"
+        } else if let today, let score = today.recoveryScore {
             var parts = ["Erholung heute \(Int(score.rounded()))/100"]
             if let hrv = today.hrvSDNN { parts.append("HRV \(Int(hrv.rounded())) ms") }
             if let resting = today.restingHeartRate { parts.append("Ruhepuls \(Int(resting.rounded()))") }
             if let sleep = today.sleepHours { parts.append(String(format: "Schlaf %.1f h", sleep)) }
             headline = parts.joined(separator: " · ")
         } else {
-            headline = "Erholung heute: noch kein Wert. Gebraucht werden HRV oder Ruhepuls aus Health und 7 Tage Basis."
+            headline = "Erholung heute: noch kein Wert. Gebraucht werden HRV oder Puls aus der letzten Nacht und 7 Nächte Basis."
         }
         let detail: String
         if let effect = effect(dataset: dataset, scheduledBasal: scheduledBasal, calendar: calendar) {
@@ -390,5 +555,99 @@ enum RheosRecovery {
         }
         guard sxx > 1e-9, syy > 1e-12 else { return nil }
         return (sxy / sxx, sxy / (sxx * syy).squareRoot())
+    }
+}
+
+/// Builds the main sleep of each night from Apple Health's sleep samples. Several apps can write
+/// sleep for the same night; each night uses the one source with the most sleep, and overlapping
+/// samples are merged, so nothing is counted twice. A night belongs to the day the person woke up.
+enum RheosSleepNights {
+    struct Sample: Equatable {
+        var start: Date
+        var end: Date
+        /// "asleep", "core", "deep", "rem", "awake" or "inBed".
+        var stage: String
+        var source: String
+    }
+
+    struct Window: Equatable {
+        var day: Date
+        var start: Date
+        var end: Date
+        var asleepHours: Double
+        var deepHours: Double?
+        var remHours: Double?
+        var awakeHours: Double
+    }
+
+    static let asleepStages: Set<String> = ["asleep", "core", "deep", "rem"]
+    /// Pieces of sleep closer than this belong to the same night.
+    static let maximumGap: TimeInterval = 60 * 60
+    /// Shorter sleep is a nap and not a night.
+    static let minimumNightHours = 3.0
+
+    static func windows(_ samples: [Sample], calendar: Calendar) -> [Window] {
+        var best: [Date: (window: Window, staged: Bool)] = [:]
+        for (_, own) in Dictionary(grouping: samples, by: \.source) {
+            let asleep = own.filter { asleepStages.contains($0.stage) && $0.end > $0.start }.sorted { $0.start < $1.start }
+            var sessions: [[Sample]] = []
+            for sample in asleep {
+                if let last = sessions.last?.map(\.end).max(), sample.start.timeIntervalSince(last) <= maximumGap {
+                    sessions[sessions.count - 1].append(sample)
+                } else {
+                    sessions.append([sample])
+                }
+            }
+            for session in sessions {
+                guard let start = session.map(\.start).min(), let end = session.map(\.end).max() else { continue }
+                let hours = unionHours(spans(session))
+                guard hours >= minimumNightHours else { continue }
+                let staged = session.contains { $0.stage == "deep" || $0.stage == "rem" || $0.stage == "core" }
+                let awake = own.filter { $0.stage == "awake" && $0.start >= start && $0.end <= end }
+                let window = Window(
+                    day: calendar.startOfDay(for: end),
+                    start: start,
+                    end: end,
+                    asleepHours: hours,
+                    deepHours: staged ? stageHours("deep", in: session) : nil,
+                    remHours: staged ? stageHours("rem", in: session) : nil,
+                    awakeHours: unionHours(spans(awake))
+                )
+                if let current = best[window.day] {
+                    // More sleep wins; with about the same sleep, the source with stages wins.
+                    let clearlyLonger = window.asleepHours > current.window.asleepHours + 0.25
+                    let sameButStaged = abs(window.asleepHours - current.window.asleepHours) <= 0.25 && staged && !current.staged
+                    if clearlyLonger || sameButStaged { best[window.day] = (window, staged) }
+                } else {
+                    best[window.day] = (window, staged)
+                }
+            }
+        }
+        return best.values.map { $0.window }.sorted { $0.day < $1.day }
+    }
+
+    private static func spans(_ samples: [Sample]) -> [(start: Date, end: Date)] {
+        samples.map { sample -> (start: Date, end: Date) in (start: sample.start, end: sample.end) }
+    }
+
+    private static func stageHours(_ stage: String, in session: [Sample]) -> Double {
+        unionHours(spans(session.filter { $0.stage == stage }))
+    }
+
+    /// Hours covered by the intervals, overlaps counted once.
+    static func unionHours(_ intervals: [(start: Date, end: Date)]) -> Double {
+        let sorted = intervals.filter { $0.end > $0.start }.sorted { $0.start < $1.start }
+        var total: TimeInterval = 0
+        var current: (start: Date, end: Date)?
+        for interval in sorted {
+            if let open = current, interval.start <= open.end {
+                current = (open.start, max(open.end, interval.end))
+            } else {
+                if let open = current { total += open.end.timeIntervalSince(open.start) }
+                current = interval
+            }
+        }
+        if let open = current { total += open.end.timeIntervalSince(open.start) }
+        return total / 3600
     }
 }
