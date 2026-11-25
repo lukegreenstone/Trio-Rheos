@@ -262,12 +262,14 @@ struct WatchHistoryLine: Identifiable, Equatable {
         self.session(session, didReceiveMessage: message)
     }
 
-    func reportHandyFreiHeartbeat() {
-        guard let session, session.activationState == .activated, session.isReachable else { return }
+    /// True when the heartbeat went out; an unreachable iPhone gets the next one on the next try.
+    @discardableResult func reportHandyFreiHeartbeat() -> Bool {
+        guard let session, session.activationState == .activated, session.isReachable else { return false }
         session.sendMessage([
             "handyFreiHeartbeat": Date().timeIntervalSince1970,
             "handyFreiRunning": handyFreiRunning
         ], replyHandler: nil) { _ in }
+        return true
     }
 
     func session(_: WCSession, didReceiveMessage message: [String: Any]) {

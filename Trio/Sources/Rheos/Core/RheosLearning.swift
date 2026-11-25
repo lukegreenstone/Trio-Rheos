@@ -78,6 +78,7 @@ enum RheosLearner {
                 learned: learned,
                 walk: walk,
                 band: band,
+                fittedISF: fitted.isf,
                 now: now
             )
         }
@@ -93,6 +94,7 @@ enum RheosLearner {
                 learned: learned.clamped(to: band),
                 walk: walk,
                 band: band,
+                fittedISF: fitted.isf,
                 now: now
             )
         }
@@ -138,6 +140,7 @@ enum RheosLearner {
                 learned: learned,
                 walk: walk,
                 band: band,
+                fittedISF: fitted.isf,
                 now: now
             )
         }
@@ -207,6 +210,7 @@ enum RheosLearner {
             learned: learned,
             walk: walk,
             band: band,
+            fittedISF: fitted.isf,
             now: now
         )
     }
@@ -324,6 +328,7 @@ enum RheosLearner {
         learned: RheosHourlyFactors,
         walk: RheosWalkForwardResult,
         band: ClosedRange<Double>,
+        fittedISF: [Double]? = nil,
         now: Date
     ) -> RheosProfileDecision {
         RheosProfileDecision(
@@ -337,7 +342,8 @@ enum RheosLearner {
             walkForward: walk,
             evaluatedAt: now,
             bandMinimum: band.lowerBound,
-            bandMaximum: band.upperBound
+            bandMaximum: band.upperBound,
+            fittedISF: fittedISF
         )
     }
 

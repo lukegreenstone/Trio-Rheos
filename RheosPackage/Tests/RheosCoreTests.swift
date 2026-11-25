@@ -1607,6 +1607,35 @@ final class RheosCoreTests: XCTestCase {
         }
     }
 
+    func testPilotNeverDosesUnderEighty() {
+        let inputs = RheosPilot.Inputs(glucose: 95, deltaPer5: -6, iob: 1.5, cob: 0, isf: 50, carbRatio: 10, target: 100, basal: 0.8)
+        let decision = RheosPilot.decide(inputs)
+        XCTAssertEqual(decision.smb, 0)
+        XCTAssertEqual(decision.rate, 0)
+    }
+
+    func testPilotSMBIsRoundedDownAndCappedAtOneHourBasal() {
+        let inputs = RheosPilot.Inputs(glucose: 220, deltaPer5: 4, iob: 0, cob: 0, isf: 40, carbRatio: 10, target: 100, basal: 0.73)
+        let decision = RheosPilot.decide(inputs)
+        XCTAssertLessThanOrEqual(decision.smb, 0.73)
+        XCTAssertEqual(decision.smb, 0.7, accuracy: 0.0001)
+        XCTAssertEqual(decision.rate, 0.73, accuracy: 0.0001)
+    }
+
+    func testPilotLowersTempWhenForecastBelowTarget() {
+        let inputs = RheosPilot.Inputs(glucose: 105, deltaPer5: 0, iob: 0.6, cob: 0, isf: 50, carbRatio: 10, target: 100, basal: 1.0)
+        let decision = RheosPilot.decide(inputs)
+        XCTAssertEqual(decision.smb, 0)
+        XCTAssertLessThan(decision.rate, 1.0)
+    }
+
+    func testPilotReadsMmolISFAsMgdl() {
+        XCTAssertEqual(RheosPilot.mgdlISF(2.5, profile: 45), 2.5 * 18.0182, accuracy: 0.001)
+        XCTAssertEqual(RheosPilot.mgdlISF(45, profile: 45), 45, accuracy: 0.001)
+        XCTAssertEqual(RheosPilot.mgdlISF(3, profile: nil), 3 * 18.0182, accuracy: 0.001)
+        XCTAssertEqual(RheosPilot.mgdlISF(40, profile: nil), 40, accuracy: 0.001)
+    }
+
     private func stableGlucose(days: ClosedRange<Int>, invertFrom: Int? = nil) -> [RheosGlucosePoint] {
         var points: [RheosGlucosePoint] = []
         for day in days {

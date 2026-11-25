@@ -143,6 +143,9 @@ struct RheosProfileDecision: Codable, Equatable {
     var evaluatedAt: Date
     var bandMinimum: Double
     var bandMaximum: Double
+    /// Hourly ISF factors Rheos learned before Dynamic ISF set them to 1. Lets the Pilot compare
+    /// the Rheos ISF with Trio's ISF while Dynamic ISF stays on. Nil in older files.
+    var fittedISF: [Double]? = nil
 
     static func inactive(mode: RheosMode, reason: String, now: Date) -> RheosProfileDecision {
         let code: RheosDecisionCode = mode == .aus ? .off : .shadow

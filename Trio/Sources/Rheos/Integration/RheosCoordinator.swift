@@ -187,7 +187,7 @@ final class RheosCoordinator {
             dataset: dataset,
             scheduledBasal: scheduledBasalByHour(),
             profileISF: profileISFByHour(),
-            learned: decision.learnedFactors,
+            learnedISF: decision.fittedISF ?? decision.learnedFactors.isf,
             now: now,
             calendar: .current
         ))

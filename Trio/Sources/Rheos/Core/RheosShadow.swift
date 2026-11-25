@@ -392,16 +392,17 @@ enum RheosPilot {
             return Decision(rate: max(0, inputs.basal + need * 2), smb: 0, eventual: eventual, minPredicted: minPredicted)
         }
         let smb = min(need * 0.5, max(inputs.basal, 0.1))
-        return Decision(rate: inputs.basal, smb: (smb / 0.05).rounded(.down) * 0.05, eventual: eventual, minPredicted: minPredicted)
+        return Decision(rate: inputs.basal, smb: (smb / 0.05 + 1e-9).rounded(.down) * 0.05, eventual: eventual, minPredicted: minPredicted)
     }
 
-    /// Replays the stored loops. `profileISF` (mg/dL per U) and the learned ISF factors give the
-    /// Rheos-ISF variant; the Trio variant uses the ISF oref used at that loop (Dynamic ISF included).
+    /// Replays the stored loops. `profileISF` (mg/dL per U) times the learned ISF factors (before
+    /// Dynamic ISF neutralizes them) gives the Rheos-ISF variant; the Trio variant uses the ISF oref
+    /// used at that loop (Dynamic ISF included).
     static func evaluate(
         dataset: RheosDataset,
         scheduledBasal: [Double],
         profileISF: [Double],
-        learned: RheosHourlyFactors?,
+        learnedISF: [Double]?,
         now: Date,
         calendar: Calendar
     ) -> Report {
@@ -438,16 +439,17 @@ enum RheosPilot {
         var highs = 0, moreBeforeHighs = 0, lessBeforeHighs = 0
         var days = Set<Date>()
         var loops = 0
-        let canCompareISF = profileISF.count == 24 && (learned?.isf.count ?? 0) == 24
+        let canCompareISF = profileISF.count == 24 && (learnedISF?.count ?? 0) == 24
         for state in dataset.states.sorted(by: { $0.date < $1.date }) {
             guard let current = state.glucose ?? value(at: state.date, within: 6 * 60),
-                  let isf = state.dynamicISF, isf > 0,
+                  let rawISF = state.dynamicISF, rawISF > 0,
                   let ratio = state.carbRatio, ratio > 0,
                   let earlier = value(at: state.date.addingTimeInterval(-15 * 60), within: 5 * 60),
                   let actual = value(at: state.date.addingTimeInterval(3 * 3600), within: 10 * 60)
             else { continue }
             let hour = calendar.component(.hour, from: state.date)
             let basal = scheduledBasal.count == 24 ? scheduledBasal[hour] : 0
+            let isf = mgdlISF(rawISF, profile: profileISF.count == 24 ? profileISF[hour] : nil)
             let inputs = Inputs(
                 glucose: current,
                 deltaPer5: (current - earlier) / 3,
@@ -463,9 +465,9 @@ enum RheosPilot {
             days.insert(calendar.startOfDay(for: state.date))
             pilotErrors.append(abs(pilot.eventual - actual))
             if let eventual = state.eventualBG { orefErrors.append(abs(eventual - actual)) }
-            if canCompareISF, let learned {
+            if canCompareISF, let learnedISF {
                 var rheos = inputs
-                rheos.isf = profileISF[hour] * learned.isf[hour]
+                rheos.isf = profileISF[hour] * learnedISF[hour]
                 trioISF.append(abs(pilot.eventual - actual))
                 rheosISF.append(abs(decide(rheos).eventual - actual))
             }
@@ -526,6 +528,14 @@ enum RheosPilot {
             ready: ready,
             lines: lines
         )
+    }
+
+    /// The JavaScript oref stores the ISF in the person's display unit, the Swift port in mg/dL.
+    /// Picks the reading closer to the profile ISF (mg/dL); without one, values under 12 are mmol/L.
+    static func mgdlISF(_ raw: Double, profile: Double?) -> Double {
+        let converted = raw * 18.0182
+        guard let profile, profile > 0 else { return raw < 12 ? converted : raw }
+        return abs(log(converted / profile)) < abs(log(raw / profile)) ? converted : raw
     }
 
     static func save(_ report: Report, defaults: UserDefaults = .standard) {

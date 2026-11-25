@@ -485,9 +485,8 @@ final class HandyFreiSession {
                 self.scheduleRefresh()
                 await MainActor.run {
                     // The iPhone needs a heartbeat within 15 minutes; every 5 saves the radio.
-                    if Date().timeIntervalSince(self.lastHeartbeat) >= 5 * 60 {
+                    if Date().timeIntervalSince(self.lastHeartbeat) >= 5 * 60, state.reportHandyFreiHeartbeat() {
                         self.lastHeartbeat = Date()
-                        state.reportHandyFreiHeartbeat()
                     }
                     self.flushOutbox(final: false)
                 }

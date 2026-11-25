@@ -99,16 +99,22 @@ enum RheosSnapshotReader {
                     iob: row.iob?.doubleValue,
                     cob: Double(row.cob),
                     dynamicISF: row.insulinSensitivity?.doubleValue,
-                    glucose: row.glucose?.doubleValue,
-                    eventualBG: row.eventualBG?.doubleValue,
-                    carbRatio: row.carbRatio?.doubleValue,
-                    target: row.currentTarget?.doubleValue,
+                    // Core Data stores 0 for a missing value; only real readings go into the replay.
+                    glucose: positive(row.glucose),
+                    eventualBG: positive(row.eventualBG),
+                    carbRatio: positive(row.carbRatio),
+                    target: positive(row.currentTarget),
                     rate: row.rate?.doubleValue,
                     duration: row.duration?.doubleValue,
                     smb: row.smbToDeliver?.doubleValue
                 )
             }
         }
+    }
+
+    private static func positive(_ value: NSDecimalNumber?) -> Double? {
+        guard let value = value?.doubleValue, value.isFinite, value > 0 else { return nil }
+        return value
     }
 
     private static func fetchAdjustments() async -> [RheosAdjustmentInterval] {
