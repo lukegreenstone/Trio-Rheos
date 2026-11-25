@@ -182,6 +182,15 @@ final class RheosCoordinator {
             now: now
         )
         store.saveDecision(decision)
+        // Rheos Pilot replays the stored loops in shadow. It reads, scores and stores a report only.
+        RheosPilot.save(RheosPilot.evaluate(
+            dataset: dataset,
+            scheduledBasal: scheduledBasalByHour(),
+            profileISF: profileISFByHour(),
+            learned: decision.learnedFactors,
+            now: now,
+            calendar: .current
+        ))
         var recorded = store.loadDocument()
         recorded.shadow = RheosShadowStatus(
             trained: fit.trained,
@@ -423,6 +432,19 @@ final class RheosCoordinator {
         }
         return (0 ..< 24).map { hour in
             [0, 15, 30, 45].map { rate(atMinute: hour * 60 + $0) }.reduce(0, +) / 4
+        }
+    }
+
+    /// Trio's ISF schedule per clock hour in mg/dL per unit, for the Pilot's ISF comparison.
+    private func profileISFByHour() -> [Double] {
+        guard let schedule = resolver.resolve(FileStorage.self)?
+            .retrieve(OpenAPS.Settings.insulinSensitivities, as: InsulinSensitivities.self) else { return [] }
+        let sorted = schedule.sensitivities.sorted { $0.offset < $1.offset }
+        guard let latest = sorted.last else { return [] }
+        let scale = schedule.units == .mmolL ? 18.0182 : 1
+        return (0 ..< 24).map { hour in
+            let entry = sorted.last(where: { $0.offset <= hour * 60 }) ?? latest
+            return NSDecimalNumber(decimal: entry.sensitivity).doubleValue * scale
         }
     }
 

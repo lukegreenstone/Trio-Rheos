@@ -98,7 +98,14 @@ enum RheosSnapshotReader {
                     date: date,
                     iob: row.iob?.doubleValue,
                     cob: Double(row.cob),
-                    dynamicISF: row.insulinSensitivity?.doubleValue
+                    dynamicISF: row.insulinSensitivity?.doubleValue,
+                    glucose: row.glucose?.doubleValue,
+                    eventualBG: row.eventualBG?.doubleValue,
+                    carbRatio: row.carbRatio?.doubleValue,
+                    target: row.currentTarget?.doubleValue,
+                    rate: row.rate?.doubleValue,
+                    duration: row.duration?.doubleValue,
+                    smb: row.smbToDeliver?.doubleValue
                 )
             }
         }

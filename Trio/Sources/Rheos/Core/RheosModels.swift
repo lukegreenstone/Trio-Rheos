@@ -199,6 +199,14 @@ struct RheosStatePoint: Codable, Equatable {
     var cob: Double? = nil
     /// Dynamic ISF from that loop cycle, mg/dL per unit. Reporting only.
     var dynamicISF: Double? = nil
+    /// What oref saw and decided in that cycle, for the Rheos Pilot replay. Older files have none.
+    var glucose: Double? = nil
+    var eventualBG: Double? = nil
+    var carbRatio: Double? = nil
+    var target: Double? = nil
+    var rate: Double? = nil
+    var duration: Double? = nil
+    var smb: Double? = nil
 }
 
 /// Autosens ratio and dynamic ISF read from the current Trio loop. Not a second bound.

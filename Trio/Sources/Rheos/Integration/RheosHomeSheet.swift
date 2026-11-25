@@ -28,6 +28,13 @@ struct RheosHomeSheet: View {
                     }
                 }
                 RheosPromptList(resolver: resolver)
+                Section("Rheos Pilot (Schatten)") {
+                    // An own dosing rule, replayed on the stored loops. It doses nothing.
+                    let lines = RheosPilot.load()?.lines ?? ["Der Pilot-Bericht entsteht bei der nächsten Rheos-Auswertung."]
+                    ForEach(lines, id: \.self) { line in
+                        Text(line).font(.footnote)
+                    }
+                }
                 Section("Chat") {
                     TextField("Frage", text: $question)
                     HStack {
@@ -96,9 +103,21 @@ struct RheosMealForm: View {
     @State private var protein = ""
     @State private var status = ""
     @State private var photo: PhotosPickerItem?
+    @State private var kind: RheosMealKind?
+    @State private var aiCarbs: Double?
 
     var body: some View {
         Section("Mahlzeit") {
+            // Quick kinds: grams learned from the meals saved with that kind.
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(RheosMealKind.quick) { quick in
+                        Button(quick.title) { choose(quick) }
+                            .buttonStyle(.bordered)
+                            .tint(kind == quick ? Color.accentColor : Color.secondary)
+                    }
+                }
+            }
             TextField("Beschreibung", text: $note)
             TextField("Kohlenhydrate g", text: $carbs)
             TextField("Fett g", text: $fat)
@@ -144,12 +163,33 @@ struct RheosMealForm: View {
     }
 
     private func show(_ result: (RheosMealEstimate?, String)) {
-        if let meal = result.0 {
+        if var meal = result.0 {
+            kind = .ai
+            aiCarbs = meal.carbs
+            var adjusted = ""
+            // How this person usually corrects the AI's carbs, from their own saved meals.
+            if let learned = RheosMealKindLearning.aiFactor(entries: RheosMealKindLearning.load()), abs(learned.factor - 1) >= 0.05 {
+                meal.carbs = (meal.carbs * learned.factor).rounded()
+                adjusted = String(format: " An dich angepasst ×%.2f (aus %d Mahlzeiten).", learned.factor, learned.count)
+            }
             fill(meal)
-            status = "Quelle: \(result.1). Tippe auf den Kohlenhydrat-Bildschirm, du speicherst dort."
+            status = "Quelle: \(result.1).\(adjusted) Tippe auf den Kohlenhydrat-Bildschirm, du speicherst dort."
         } else {
             status = result.1
         }
+    }
+
+    private func choose(_ quick: RheosMealKind) {
+        kind = quick
+        aiCarbs = nil
+        let learned = RheosMealKindLearning.suggestion(for: quick, entries: RheosMealKindLearning.load())
+        carbs = String(format: "%.0f", learned.carbs)
+        fat = String(format: "%.0f", learned.fat)
+        protein = String(format: "%.0f", learned.protein)
+        if note.isEmpty { note = quick.title }
+        status = learned.count >= RheosMealKindLearning.minimumEntries
+            ? "\(quick.title): gelernt aus \(learned.count) deiner Mahlzeiten. Anpassen, dann zum Kohlenhydrat-Bildschirm."
+            : "\(quick.title): Startwert. Ab \(RheosMealKindLearning.minimumEntries) gespeicherten Mahlzeiten lernt Rheos deine Menge."
     }
 
     private func estimate() async {
@@ -174,6 +214,16 @@ struct RheosMealForm: View {
         if let problem = RheosMealHandoff.saveForTreatments(draft) {
             status = problem
             return
+        }
+        if let kind {
+            RheosMealKindLearning.append(RheosMealKindEntry(
+                date: Date(),
+                kind: kind,
+                carbs: draft.carbs,
+                fat: draft.fat,
+                protein: draft.protein,
+                aiCarbs: kind == .ai ? aiCarbs : nil
+            ))
         }
         status = "Werte sind bereit. Der Kohlenhydrat-Bildschirm öffnet sich. Du speicherst dort."
         if nestedInHomeSheet {

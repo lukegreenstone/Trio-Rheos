@@ -171,6 +171,14 @@ With the Cloud-Auswertung switch and a key, the chat can call read-only tools (`
 
 A refresh runs at most every 25 minutes unless the mode changes or the settings button asks for it, trains the core model once, at utility priority, and skips the small network in Low Power Mode. The Rheos file is written two seconds after the last change in a row, without indentation, and once more when the app goes to the background. Nearest loop states are found by binary search.
 
+## Rheos Pilot
+
+The Pilot is an own dosing rule that runs only in shadow (`RheosPilot`). At each refresh it replays the stored loops of the last weeks with the state Trio had then (glucose, 15-minute trend, IOB, COB, the ISF and carb ratio oref used, target) and decides what it would have done: no insulin when glucose or its 30/60-minute forecast is under 80, a lower temp when the forecast is below target, otherwise half the insulin needed for the target as an SMB, capped at one hour of basal. It is scored against the glucose three hours later, against oref's eventual BG, and on the loops before later lows and highs. It also compares Trio's ISF (Dynamic ISF included) with the Rheos-learned ISF on the same replay. It never doses. "Reif" needs 4 weeks, less insulin than oref before lows, at least as much before highs and a better forecast; switching control is a separate step the user decides and that keeps oref's limits.
+
+## Meal kinds
+
+The meal screen offers quick kinds (Wenig KH, Mittel, Viel KH, Fettig, Eiweißreich). Their grams start from defaults and become the recency-weighted median of what the person saved for that kind. An AI estimate is multiplied by how the person usually corrects the AI's carbs (0.6–1.6, from at least three meals). Whether a meal's grams were enough is left to the carb-ratio learning, which already reads the SMBs after each meal. Everything still goes through Trio's carb screen and bolus confirmation.
+
 ## Handy-frei on the watch
 
 The watch runs the same Swift determine-basal as the iPhone (`HandyFreiLoop.tick`) and talks to the Medtrum patch and the Libre 3 itself.

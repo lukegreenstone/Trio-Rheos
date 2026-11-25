@@ -45,7 +45,7 @@ enum RheosChatParser {
 enum RheosChatTools {
     static let guidance = """
     Du hast Werkzeuge, die echte Daten dieser Person auf dem iPhone lesen: glucose_by_hour, day_summary, \
-    meal_outcomes, learned_factors, delivered_basal, activity, recovery. Rufe sie auf, bevor du über Muster, Tage, \
+    meal_outcomes, learned_factors, delivered_basal, activity, recovery, pilot. Rufe sie auf, bevor du über Muster, Tage, \
     Mahlzeiten oder Einstellungen sprichst, und nenne die Zahlen daraus. Erfinde keine Werte. Die Werkzeuge \
     lesen nur. Sie dosieren nicht und ändern keine Einstellung.
     """
@@ -81,6 +81,11 @@ enum RheosChatTools {
                 "activity",
                 "Workouts and sleep from Apple Health over the last days.",
                 properties: ["days": integer("Days back, 1 to 30. Default 7.")]
+            ),
+            function(
+                "pilot",
+                "The Rheos Pilot shadow report: how an own dosing rule would have decided on the stored loops compared with oref and with what happened, and whether Trio's ISF or the Rheos-learned ISF predicted better.",
+                properties: [:]
             ),
             function(
                 "recovery",
@@ -139,6 +144,8 @@ enum RheosChatTools {
             return activity(dataset, days: days(7, 30), now: now, calendar: calendar)
         case "recovery":
             return recovery(dataset, days: days(14, 45), scheduledBasal: scheduledBasal, now: now, calendar: calendar)
+        case "pilot":
+            return RheosPilot.load()?.lines.joined(separator: "\n") ?? "Noch kein Pilot-Bericht. Er entsteht bei der nächsten Rheos-Auswertung."
         default:
             return "Unbekanntes Werkzeug \(name)."
         }

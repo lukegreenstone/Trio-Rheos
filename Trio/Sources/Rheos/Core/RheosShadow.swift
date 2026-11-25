@@ -329,3 +329,215 @@ enum RheosChatSituation {
         return "Noch keine geprüfte Schattenprognose. "
     }
 }
+
+/// Rheos Pilot: an own dosing rule that runs only in shadow. It replays every stored loop of the last
+/// weeks with the state Trio had at that moment (glucose, trend, IOB, COB, ISF, carb ratio, target),
+/// decides what it would have done, and is scored against what happened afterwards and against what
+/// oref decided. It never doses and never changes a setting.
+///
+/// The rule is deliberately plain and readable: a glucose forecast from trend, insulin on board and
+/// carbs on board; no insulin when the forecast or glucose is under 80; half of the insulin needed for
+/// the target as an SMB, capped at one hour of basal; a lower temp when the forecast is below target.
+enum RheosPilot {
+    static let reportKey = "rheos.pilot.report"
+
+    struct Inputs {
+        var glucose: Double
+        var deltaPer5: Double
+        var iob: Double
+        var cob: Double
+        var isf: Double
+        var carbRatio: Double
+        var target: Double
+        var basal: Double
+    }
+
+    struct Decision: Equatable {
+        var rate: Double
+        var smb: Double
+        var eventual: Double
+        var minPredicted: Double
+    }
+
+    struct Report: Codable, Equatable {
+        var evaluatedAt: Date
+        var loops: Int
+        var days: Int
+        var pilotError: Double?
+        var orefError: Double?
+        var trioISFError: Double?
+        var rheosISFError: Double?
+        var lowsAfter: Int
+        var pilotLessBeforeLows: Int
+        var pilotMoreBeforeLows: Int
+        var highsAfter: Int
+        var pilotMoreBeforeHighs: Int
+        var pilotLessBeforeHighs: Int
+        var ready: Bool
+        var lines: [String]
+    }
+
+    static func decide(_ inputs: Inputs) -> Decision {
+        let isf = max(inputs.isf, 1)
+        let csf = inputs.carbRatio > 0 ? isf / inputs.carbRatio : 0
+        let pred30 = inputs.glucose + inputs.deltaPer5 * 3 - 0.15 * inputs.iob * isf + min(inputs.cob, 15) * csf
+        let pred60 = inputs.glucose + inputs.deltaPer5 * 4 - 0.35 * inputs.iob * isf + min(inputs.cob, 30) * csf
+        let eventual = inputs.glucose + inputs.deltaPer5 * 4 - inputs.iob * isf + inputs.cob * csf
+        let minPredicted = min(inputs.glucose, pred30, pred60)
+        if inputs.glucose < 80 || minPredicted < 80 {
+            return Decision(rate: 0, smb: 0, eventual: eventual, minPredicted: minPredicted)
+        }
+        let need = (eventual - inputs.target) / isf
+        if need <= 0 {
+            return Decision(rate: max(0, inputs.basal + need * 2), smb: 0, eventual: eventual, minPredicted: minPredicted)
+        }
+        let smb = min(need * 0.5, max(inputs.basal, 0.1))
+        return Decision(rate: inputs.basal, smb: (smb / 0.05).rounded(.down) * 0.05, eventual: eventual, minPredicted: minPredicted)
+    }
+
+    /// Replays the stored loops. `profileISF` (mg/dL per U) and the learned ISF factors give the
+    /// Rheos-ISF variant; the Trio variant uses the ISF oref used at that loop (Dynamic ISF included).
+    static func evaluate(
+        dataset: RheosDataset,
+        scheduledBasal: [Double],
+        profileISF: [Double],
+        learned: RheosHourlyFactors?,
+        now: Date,
+        calendar: Calendar
+    ) -> Report {
+        let glucose = dataset.glucose.filter { $0.mgdl > 0 && $0.mgdl.isFinite }.sorted { $0.date < $1.date }
+        let dates = glucose.map(\.date)
+        func value(at date: Date, within: TimeInterval) -> Double? {
+            guard let index = RheosStats.nearestIndex(sortedDates: dates, to: date),
+                  abs(dates[index].timeIntervalSince(date)) <= within else { return nil }
+            return glucose[index].mgdl
+        }
+        func lowerBound(_ date: Date) -> Int {
+            var low = 0
+            var high = dates.count
+            while low < high {
+                let middle = (low + high) / 2
+                if dates[middle] < date { low = middle + 1 } else { high = middle }
+            }
+            return low
+        }
+        func window(_ from: Date, _ to: Date) -> [Double] {
+            var values: [Double] = []
+            var index = lowerBound(from)
+            while index < glucose.count, glucose[index].date <= to {
+                values.append(glucose[index].mgdl)
+                index += 1
+            }
+            return values
+        }
+        var pilotErrors: [Double] = []
+        var orefErrors: [Double] = []
+        var trioISF: [Double] = []
+        var rheosISF: [Double] = []
+        var lows = 0, lessBeforeLows = 0, moreBeforeLows = 0
+        var highs = 0, moreBeforeHighs = 0, lessBeforeHighs = 0
+        var days = Set<Date>()
+        var loops = 0
+        let canCompareISF = profileISF.count == 24 && (learned?.isf.count ?? 0) == 24
+        for state in dataset.states.sorted(by: { $0.date < $1.date }) {
+            guard let current = state.glucose ?? value(at: state.date, within: 6 * 60),
+                  let isf = state.dynamicISF, isf > 0,
+                  let ratio = state.carbRatio, ratio > 0,
+                  let earlier = value(at: state.date.addingTimeInterval(-15 * 60), within: 5 * 60),
+                  let actual = value(at: state.date.addingTimeInterval(3 * 3600), within: 10 * 60)
+            else { continue }
+            let hour = calendar.component(.hour, from: state.date)
+            let basal = scheduledBasal.count == 24 ? scheduledBasal[hour] : 0
+            let inputs = Inputs(
+                glucose: current,
+                deltaPer5: (current - earlier) / 3,
+                iob: state.iob ?? 0,
+                cob: state.cob ?? 0,
+                isf: isf,
+                carbRatio: ratio,
+                target: state.target ?? 100,
+                basal: basal
+            )
+            let pilot = decide(inputs)
+            loops += 1
+            days.insert(calendar.startOfDay(for: state.date))
+            pilotErrors.append(abs(pilot.eventual - actual))
+            if let eventual = state.eventualBG { orefErrors.append(abs(eventual - actual)) }
+            if canCompareISF, let learned {
+                var rheos = inputs
+                rheos.isf = profileISF[hour] * learned.isf[hour]
+                trioISF.append(abs(pilot.eventual - actual))
+                rheosISF.append(abs(decide(rheos).eventual - actual))
+            }
+            // Insulin each side adds over the next 30 minutes, relative to scheduled basal.
+            let orefTemp = state.rate.map { rate in (state.duration ?? 0) > 0 ? (rate - basal) * 0.5 : 0 } ?? 0
+            let orefNet = (state.smb ?? 0) + orefTemp
+            let pilotNet = pilot.smb + (pilot.rate - basal) * 0.5
+            let next2h = window(state.date, state.date.addingTimeInterval(2 * 3600))
+            let next3h = window(state.date, state.date.addingTimeInterval(3 * 3600))
+            if let low = next2h.min(), low < 70 {
+                lows += 1
+                if pilotNet < orefNet - 0.05 { lessBeforeLows += 1 } else if pilotNet > orefNet + 0.05 { moreBeforeLows += 1 }
+            } else if let high = next3h.max(), high > 180, (next3h.min() ?? 100) >= 80 {
+                highs += 1
+                if pilotNet > orefNet + 0.05 { moreBeforeHighs += 1 } else if pilotNet < orefNet - 0.05 { lessBeforeHighs += 1 }
+            }
+        }
+        let pilotError = RheosStats.mean(pilotErrors)
+        let orefError = RheosStats.mean(orefErrors)
+        let trioError = RheosStats.mean(trioISF)
+        let rheosError = RheosStats.mean(rheosISF)
+        let safer = lessBeforeLows >= 2 * max(1, moreBeforeLows)
+        let firmer = moreBeforeHighs >= lessBeforeHighs
+        let forecasts = (pilotError ?? .infinity) <= (orefError ?? 0) * 0.95
+        let ready = days.count >= 28 && safer && firmer && forecasts
+        var lines: [String] = []
+        if loops == 0 {
+            lines.append("Rheos Pilot: noch keine nachrechenbaren Loops. Gebraucht werden gespeicherte Entscheidungen mit ISF und KH-Faktor und Glukose 3 Stunden danach.")
+        } else {
+            lines.append("Rheos Pilot (Schatten) über \(loops) Loops an \(days.count) Tagen. Er hat nichts dosiert.")
+            if let pilotError, let orefError {
+                lines.append(String(format: "Vorhersage für 3 Stunden: Pilot im Mittel %.0f mg/dL daneben, oref %.0f mg/dL.", pilotError, orefError))
+            }
+            lines.append("Vor \(lows) späteren Unterzuckern hätte der Pilot \(lessBeforeLows)-mal weniger und \(moreBeforeLows)-mal mehr Insulin gegeben als oref.")
+            lines.append("Vor \(highs) späteren Hochs ohne Unterzucker hätte er \(moreBeforeHighs)-mal mehr und \(lessBeforeHighs)-mal weniger gegeben.")
+            if let trioError, let rheosError {
+                let better = rheosError < trioError ? "Der von Rheos gelernte ISF" : "Trios ISF (bei dir mit Dynamic ISF)"
+                lines.append(String(format: "ISF-Vergleich: mit Trios ISF %.0f, mit Rheos-ISF %.0f mg/dL Fehler. %@ beschreibt deinen Verlauf hier besser.", trioError, rheosError, better))
+            }
+            lines.append(ready
+                ? "Reif zum Vergleich mit echter Steuerung: über 4 Wochen, sicherer vor Unterzuckern, nicht zögerlicher vor Hochs und bessere Vorhersage. Die Übernahme entscheidest du."
+                : "Noch nicht reif: gebraucht werden 4 Wochen, weniger Insulin vor Unterzuckern, mindestens so viel vor Hochs und eine bessere Vorhersage als oref.")
+        }
+        return Report(
+            evaluatedAt: now,
+            loops: loops,
+            days: days.count,
+            pilotError: pilotError,
+            orefError: orefError,
+            trioISFError: trioError,
+            rheosISFError: rheosError,
+            lowsAfter: lows,
+            pilotLessBeforeLows: lessBeforeLows,
+            pilotMoreBeforeLows: moreBeforeLows,
+            highsAfter: highs,
+            pilotMoreBeforeHighs: moreBeforeHighs,
+            pilotLessBeforeHighs: lessBeforeHighs,
+            ready: ready,
+            lines: lines
+        )
+    }
+
+    static func save(_ report: Report, defaults: UserDefaults = .standard) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        if let data = try? encoder.encode(report) { defaults.set(data, forKey: reportKey) }
+    }
+
+    static func load(_ defaults: UserDefaults = .standard) -> Report? {
+        guard let data = defaults.data(forKey: reportKey) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(Report.self, from: data)
+    }
+}

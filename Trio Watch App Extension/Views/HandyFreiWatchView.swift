@@ -263,6 +263,8 @@ final class HandyFreiSession {
     private var bolusUncertain = false
     /// Under 10 % battery: the loop only lowers insulin.
     private var lowBattery = false
+    private var lastHeartbeat = Date.distantPast
+    private var lastPrune = Date.distantPast
     /// Another app started a workout. Restarting ours would end that training, so the watch waits
     /// until Trio is opened again.
     private var yieldedToForeignWorkout = false
@@ -482,7 +484,11 @@ final class HandyFreiSession {
             while state.handyFreiRunning, epoch == self.doseEpoch, !Task.isCancelled {
                 self.scheduleRefresh()
                 await MainActor.run {
-                    state.reportHandyFreiHeartbeat()
+                    // The iPhone needs a heartbeat within 15 minutes; every 5 saves the radio.
+                    if Date().timeIntervalSince(self.lastHeartbeat) >= 5 * 60 {
+                        self.lastHeartbeat = Date()
+                        state.reportHandyFreiHeartbeat()
+                    }
                     self.flushOutbox(final: false)
                 }
                 try? await Task.sleep(nanoseconds: 60_000_000_000)
@@ -528,7 +534,9 @@ final class HandyFreiSession {
     /// Keeps the countdown moving, and starts the loop when it reaches zero.
     @MainActor private func watchLoop(_ state: WatchState, epoch: Int) async {
         while state.handyFreiRunning, epoch == doseEpoch, !Task.isCancelled {
-            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            // The countdown on screen moves every 15 s; in the background every 30 s is enough.
+            let seconds: UInt64 = WKApplication.shared().applicationState == .active ? 15 : 30
+            try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
             guard state.handyFreiRunning, epoch == doseEpoch, !Task.isCancelled else { return }
             let stuck = await MainActor.run { () -> Bool in
                 guard let started = self.doseStartedAt, self.dosing else { return false }
@@ -1144,7 +1152,11 @@ final class HandyFreiSession {
             if !direction.isEmpty { directions[stamp.timeIntervalSince1970] = direction }
             state.trend = direction.isEmpty ? state.trend : direction
             stallAttempts = 0
-            prune()
+            // Dropping day-old rows once every 15 minutes is enough; it ran on every reading.
+            if Date().timeIntervalSince(lastPrune) >= 15 * 60 {
+                lastPrune = Date()
+                prune()
+            }
             log.append(["date": Date().timeIntervalSince1970, "kind": "glucose", "mgdl": mgdl])
             HandyFreiDisk.save(session: self, urgent: false)
             HandyFreiAlarm.check(mgdl: mgdl, files: state.handyFreiFiles)
@@ -1660,7 +1672,8 @@ final class HandyFreiSession {
         guard WCSession.isSupported() else { return }
         let session = boundState?.session ?? WCSession.default
         guard session.activationState == .activated else { return }
-        let interval: TimeInterval = session.isReachable ? 45 : 10 * 60
+        // The iPhone only shows these rows while Handy-frei runs; the hand-back sends a final flush.
+        let interval: TimeInterval = session.isReachable ? 120 : 10 * 60
         if !final, Date().timeIntervalSince(lastOutboxFlush) < interval { return }
         HandyFreiDisk.preload(self)
         lastOutboxFlush = Date()

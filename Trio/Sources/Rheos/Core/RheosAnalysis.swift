@@ -358,3 +358,98 @@ enum RheosNightLow {
     }
 }
 
+
+/// Quick meal kinds on the Rheos meal screen. They start from defaults and become the person's own:
+/// the grams they actually saved for that kind, recent meals counting more. Whether the grams were
+/// enough is not judged here; the carb-ratio learning already reads the SMBs after each meal, and
+/// judging it twice would move insulin twice.
+enum RheosMealKind: String, Codable, CaseIterable, Identifiable {
+    case light
+    case medium
+    case heavy
+    case fatty
+    case protein
+    case ai
+
+    var id: String { rawValue }
+
+    static let quick: [RheosMealKind] = [.light, .medium, .heavy, .fatty, .protein]
+
+    var title: String {
+        switch self {
+        case .light: return "Wenig KH"
+        case .medium: return "Mittel"
+        case .heavy: return "Viel KH"
+        case .fatty: return "Fettig"
+        case .protein: return "Eiweißreich"
+        case .ai: return "KI-Schätzung"
+        }
+    }
+
+    var defaults: (carbs: Double, fat: Double, protein: Double) {
+        switch self {
+        case .light: return (20, 5, 10)
+        case .medium: return (45, 10, 20)
+        case .heavy: return (80, 15, 25)
+        case .fatty: return (40, 35, 30)
+        case .protein: return (15, 15, 45)
+        case .ai: return (0, 0, 0)
+        }
+    }
+}
+
+struct RheosMealKindEntry: Codable, Equatable {
+    var date: Date
+    var kind: RheosMealKind
+    var carbs: Double
+    var fat: Double
+    var protein: Double
+    /// The AI's carbs before the person changed them, for `.ai` entries.
+    var aiCarbs: Double? = nil
+}
+
+enum RheosMealKindLearning {
+    static let key = "rheos.mealKinds"
+    static let minimumEntries = 3
+
+    static func load(_ defaults: UserDefaults = .standard) -> [RheosMealKindEntry] {
+        guard let data = defaults.data(forKey: key) else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return (try? decoder.decode([RheosMealKindEntry].self, from: data)) ?? []
+    }
+
+    static func append(_ entry: RheosMealKindEntry, defaults: UserDefaults = .standard) {
+        var entries = load(defaults)
+        entries.append(entry)
+        if entries.count > 300 { entries.removeFirst(entries.count - 300) }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        if let data = try? encoder.encode(entries) { defaults.set(data, forKey: key) }
+    }
+
+    /// The grams to prefill for a kind, and how many of the person's own meals they come from.
+    static func suggestion(for kind: RheosMealKind, entries: [RheosMealKindEntry]) -> (carbs: Double, fat: Double, protein: Double, count: Int) {
+        let own = entries.filter { $0.kind == kind }
+        let start = kind.defaults
+        guard own.count >= minimumEntries, let newest = own.map(\.date).max() else {
+            return (start.carbs, start.fat, start.protein, own.count)
+        }
+        func median(_ value: (RheosMealKindEntry) -> Double) -> Double {
+            RheosStats.weightedMedian(own.map { (value: value($0), weight: RheosReference.recencyWeight($0.date, newest: newest)) }) ?? 0
+        }
+        return ((median { $0.carbs }).rounded(), (median { $0.fat }).rounded(), (median { $0.protein }).rounded(), own.count)
+    }
+
+    /// How the person usually corrects the AI's carbs: their saved grams divided by the AI's,
+    /// recent meals counting more. Nil until three such meals exist. Kept within 0.6–1.6.
+    static func aiFactor(entries: [RheosMealKindEntry]) -> (factor: Double, count: Int)? {
+        let pairs = entries.filter { $0.kind == .ai && ($0.aiCarbs ?? 0) >= 5 && $0.carbs > 0 }
+        guard pairs.count >= minimumEntries, let newest = pairs.map(\.date).max() else { return nil }
+        let ratios = pairs.map { entry in
+            (value: entry.carbs / (entry.aiCarbs ?? entry.carbs), weight: RheosReference.recencyWeight(entry.date, newest: newest))
+        }
+        guard let factor = RheosStats.weightedMedian(ratios) else { return nil }
+        return (min(1.6, max(0.6, factor)), pairs.count)
+    }
+}

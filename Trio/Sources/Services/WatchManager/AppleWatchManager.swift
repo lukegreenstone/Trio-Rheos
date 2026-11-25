@@ -1092,6 +1092,8 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
     }
 
     /// Asks a reachable watch whether Handy-frei is still running. A reply, or a pushed heartbeat, can return the sensor.
+    private var lastHandyFreiStatusRequest = Date.distantPast
+
     private func checkHandyFreiHandoff() {
         let cgm = fetchGlucoseManager.cgmManager
         HandyFreiPhone.bindLibre(cgm)
@@ -1110,6 +1112,10 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
             HandyFreiPhone.noteWatch(reachable: false, running: nil, heartbeat: nil, cgm: cgm)
             return
         }
+        // Every 5 minutes is enough for a 15-minute silence limit; a request every minute woke the
+        // watch's radio each time while it loops alone.
+        guard Date().timeIntervalSince(lastHandyFreiStatusRequest) >= 5 * 60 else { return }
+        lastHandyFreiStatusRequest = Date()
         session.sendMessage(["handyFreiStatusRequest": true], replyHandler: { [weak self] reply in
             let running = reply["handyFreiRunning"] as? Bool
             let beat = (reply["handyFreiHeartbeat"] as? NSNumber)?.doubleValue
